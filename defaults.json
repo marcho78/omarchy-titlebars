@@ -1,0 +1,40 @@
+{
+  "enabled": true,
+
+  "style": "dots",
+  "buttons": "right",
+  "order": "standard",
+  "showMinimize": true,
+  "showMaximize": true,
+  "showClose": true,
+  "buttonSize": 12,
+  "buttonSpacing": 8,
+
+  "title": true,
+  "titleAlign": "center",
+  "titleFont": "",
+  "titleSize": 12,
+  "titleWeight": "medium",
+  "dimInactive": true,
+
+  "barHeight": 26,
+  "barPadding": 12,
+  "borderAroundBar": true,
+  "doubleClick": "maximize",
+
+  "followTheme": true,
+  "colors": {
+    "bar": "background",
+    "title": "foreground",
+    "titleInactive": "dark_foreground",
+    "close": "red",
+    "maximize": "green",
+    "minimize": "yellow",
+    "icon": "darker_background",
+    "inactiveButton": "muted"
+  },
+
+  "noBarApps": [],
+  "shortcuts": true,
+  "settingsButton": true
+}

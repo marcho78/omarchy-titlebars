@@ -1,0 +1,331 @@
+#!/bin/bash
+
+# Title Bars: window title bars with minimize / maximize / close buttons for
+# Omarchy, drawn by hyprbars (https://github.com/hyprwm/hyprland-plugins).
+
+set -euo pipefail
+
+PLUGIN_ID="marcho78.titlebars"
+PLUGIN_DIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+DEFAULTS="$PLUGIN_DIR/defaults.json"
+SCHEMA="$PLUGIN_DIR/schema.json"
+SETTINGS="$HOME/.config/omarchy/titlebars.json"
+THEME_COLORS="$HOME/.local/state/omarchy/current/theme/colors.toml"
+
+BUILD_DIR="$HOME/.local/share/hyprbars"
+BUILD_SRC="$BUILD_DIR/hyprland-plugins"
+BUILD_PLUGIN="$BUILD_DIR/hyprbars.so"
+BUILD_STAMP="$BUILD_DIR/built-for-hyprland"
+HYPRBARS_REPO="https://github.com/hyprwm/hyprland-plugins"
+HYPRLAND_VERSION_H="/usr/include/hyprland/src/version.h"
+
+HYPR_CONFIG="$HOME/.config/hypr/hyprland.lua"
+HYPR_STUB="$HOME/.config/hypr/titlebars.lua"
+REQUIRE_LINE='require("hypr.titlebars")'
+HOOK="$HOME/.config/omarchy/hooks/post-update.d/titlebars.hook"
+MENU="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
+MENU_ENTRY="  \"style.titlebars\": {\"icon\":\"󰖯\",\"label\":\"Title Bars\",\"action\":\"omarchy-shell shell summon $PLUGIN_ID '{}'\"},"
+CLI_LINK="$HOME/.local/bin/titlebars"
+
+usage() {
+  cat <<EOF
+Usage: titlebars <command>
+
+  settings [page]       Open the settings panel (buttons, title, colors, bar, behavior)
+  set <key> <value>     Change a setting, e.g. \`titlebars set buttons left\`
+  get [key]             Show all settings, or one
+  reset                 Go back to the default look
+  status                Show what is installed and loaded
+
+  setup                 Build hyprbars and hook Title Bars into Hyprland (safe to re-run)
+  build [--force]       Rebuild hyprbars for the installed Hyprland
+  uninstall [--purge]   Unhook Title Bars from Hyprland (--purge also deletes settings and the build)
+
+Settings live in $SETTINGS; keys and defaults are in $DEFAULTS.
+Colors are theme roles from colors.toml (red, accent, background, ...) or #rrggbb / #rrggbbaa.
+EOF
+}
+
+reload_hyprland() {
+  if [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]]; then
+    hyprctl reload >/dev/null
+  fi
+}
+
+# Settings --------------------------------------------------------------------
+
+current_settings() {
+  if [[ -s $SETTINGS ]]; then
+    jq -s '.[0] * .[1]' "$DEFAULTS" "$SETTINGS"
+  else
+    jq . "$DEFAULTS"
+  fi
+}
+
+# Keep only the values that differ from the defaults, so defaults can improve.
+write_settings() {
+  local merged="$1" tmp
+  mkdir -p "$(dirname "$SETTINGS")"
+  tmp=$(mktemp "$SETTINGS.XXXXXX")
+  jq --slurpfile defaults "$DEFAULTS" '
+    $defaults[0] as $d
+    | with_entries(select(.key as $k | $d | has($k)))
+    | with_entries(select(.value != $d[.key]))
+    | if .colors then .colors |= with_entries(select(.value != $d.colors[.key])) else . end
+    | if .colors == {} then del(.colors) else . end
+  ' <<<"$merged" >"$tmp"
+  mv -f "$tmp" "$SETTINGS"
+}
+
+cmd_get() {
+  if (($# == 0)); then
+    current_settings
+  elif ! current_settings | jq -r --arg key "$1" '
+    (try getpath($key | split(".")) catch null) as $value
+    | if $value == null then halt_error(1) else $value end' 2>/dev/null; then
+    echo "titlebars: unknown setting '$1'" >&2
+    exit 1
+  fi
+}
+
+cmd_set() {
+  (($# == 2)) || { echo "Usage: titlebars set <key> <value>" >&2; exit 1; }
+  local key="$1" raw="$2" kind value
+
+  kind=$(jq -r --arg key "$key" 'getpath($key | split(".")) | type' "$DEFAULTS")
+  case $kind in
+  boolean)
+    case ${raw,,} in
+    true | on | yes | 1) value=true ;;
+    false | off | no | 0) value=false ;;
+    *) echo "titlebars: $key takes on or off" >&2; exit 1 ;;
+    esac
+    ;;
+  number)
+    local range
+    range=$(jq -r --arg key "$key" '.ranges[$key] // [0, 999] | join(" ")' "$SCHEMA")
+    if [[ ! $raw =~ ^[0-9]+$ ]] || ((raw < ${range% *} || raw > ${range#* })); then
+      echo "titlebars: $key takes a whole number from ${range% *} to ${range#* }" >&2
+      exit 1
+    fi
+    value=$raw
+    ;;
+  string)
+    local allowed
+    allowed=$(jq -r --arg key "$key" '.choices[$key] // empty | join(" ")' "$SCHEMA")
+    if [[ -n $allowed && " $allowed " != *" $raw "* ]]; then
+      echo "titlebars: $key takes one of: $allowed" >&2
+      exit 1
+    fi
+    if [[ $key == colors.* && ! $raw =~ ^#([0-9a-fA-F]{6}|[0-9a-fA-F]{8})$ ]] &&
+      ! { [[ $raw =~ ^[a-z_]+$ ]] && grep -qE "^[[:space:]]*$raw[[:space:]]*=" "$THEME_COLORS" 2>/dev/null; }; then
+      echo "titlebars: $key takes #rrggbb, #rrggbbaa, or a theme color name from colors.toml" >&2
+      exit 1
+    fi
+    value=$(jq -n --arg v "$raw" '$v')
+    ;;
+  array) value=$(jq -n --arg v "$raw" '$v | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(. != ""))') ;;
+  *) echo "titlebars: unknown setting '$key' (see \`titlebars get\`)" >&2; exit 1 ;;
+  esac
+
+  write_settings "$(current_settings | jq --arg key "$key" --argjson value "$value" 'setpath($key | split("."); $value)')"
+  reload_hyprland
+}
+
+cmd_reset() {
+  rm -f "$SETTINGS"
+  reload_hyprland
+  echo "Title bars are back to the default look."
+}
+
+cmd_settings() {
+  omarchy-shell shell summon "$PLUGIN_ID" "$(jq -cn --arg page "${1:-}" 'if $page == "" then {} else {page: $page} end')" >/dev/null
+}
+
+# Build -----------------------------------------------------------------------
+
+cmd_build() {
+  if [[ ! -f $HYPRLAND_VERSION_H ]]; then
+    echo "titlebars: Hyprland headers are missing ($HYPRLAND_VERSION_H)" >&2
+    exit 1
+  fi
+  for tool in git make g++ pkg-config; do
+    command -v "$tool" >/dev/null || { echo "titlebars: $tool is needed to build hyprbars (omarchy pkg add base-devel)" >&2; exit 1; }
+  done
+
+  local hyprland_commit hyprland_version pinned
+  hyprland_commit=$(sed -n 's/^#define GIT_COMMIT_HASH *"\([0-9a-f]*\)".*/\1/p' "$HYPRLAND_VERSION_H")
+  hyprland_version=$(pkg-config --modversion hyprland)
+
+  if [[ ${1:-} != "--force" && -f $BUILD_PLUGIN && -f $BUILD_DIR/features && $(cat "$BUILD_STAMP" 2>/dev/null) == "$hyprland_commit" ]]; then
+    echo "hyprbars is already built for Hyprland $hyprland_version"
+    return
+  fi
+
+  mkdir -p "$BUILD_DIR"
+  if [[ -d $BUILD_SRC/.git ]]; then
+    git -C "$BUILD_SRC" fetch --quiet origin
+  else
+    git clone --quiet "$HYPRBARS_REPO" "$BUILD_SRC"
+  fi
+
+  # hyprpm.toml pins a plugin commit for each Hyprland release commit. Fall back
+  # to the latest main when a brand-new Hyprland release hasn't been pinned yet.
+  pinned=$(git -C "$BUILD_SRC" show origin/main:hyprpm.toml |
+    sed -n "s/.*\[\"$hyprland_commit\", *\"\([0-9a-f]\{40\}\)\"\].*/\1/p" | head -n1)
+  git -C "$BUILD_SRC" checkout --quiet --force --detach "${pinned:-origin/main}"
+
+  # Our patch lets the settings button sit on the other side of the bar. If a
+  # newer hyprbars no longer takes it, build without it and the button hides.
+  local features=""
+  if git -C "$BUILD_SRC" apply --check "$PLUGIN_DIR/hypr/hyprbars-opposite.patch" 2>/dev/null; then
+    git -C "$BUILD_SRC" apply "$PLUGIN_DIR/hypr/hyprbars-opposite.patch"
+    features="opposite"
+  else
+    echo "Note: the settings-button patch doesn't fit this hyprbars version; building without it."
+  fi
+
+  echo "Building hyprbars $(git -C "$BUILD_SRC" rev-parse --short HEAD) for Hyprland $hyprland_version..."
+  # Upstream builds with narrowing warnings; hide them but keep real errors.
+  CXXFLAGS="-O2 -w" make --always-make --silent -C "$BUILD_SRC/hyprbars" all
+
+  # Replace via rename so a running Hyprland keeps its mapped copy intact.
+  install -m 644 "$BUILD_SRC/hyprbars/hyprbars.so" "$BUILD_PLUGIN.new"
+  mv -f "$BUILD_PLUGIN.new" "$BUILD_PLUGIN"
+  echo "$features" >"$BUILD_DIR/features"
+  git -C "$BUILD_SRC" checkout --quiet -- .
+  echo "$hyprland_commit" >"$BUILD_STAMP"
+  echo "Installed $BUILD_PLUGIN"
+}
+
+# Setup -----------------------------------------------------------------------
+
+# Mirrors how the Omarchy menu reads JSONC: drop comment lines and trailing commas.
+menu_is_valid() {
+  sed -E 's#^[[:space:]]*//.*$##' "$1" | perl -0777 -pe 's/,(\s*[}\]])/$1/g' | jq -e 'type == "object"' >/dev/null 2>&1
+}
+
+add_menu_entry() {
+  if [[ ! -f $MENU ]]; then
+    mkdir -p "$(dirname "$MENU")"
+    printf '{\n%s\n}\n' "$MENU_ENTRY" >"$MENU"
+    return
+  fi
+  grep -q '"style.titlebars"' "$MENU" && return
+
+  local tmp
+  tmp=$(mktemp)
+  awk -v entry="$MENU_ENTRY" '!done && /^[[:space:]]*\{/ { print; print entry; done = 1; next } { print }' "$MENU" >"$tmp"
+  if menu_is_valid "$tmp"; then
+    cat "$tmp" >"$MENU"
+  else
+    echo "Couldn't add Title Bars to the Omarchy menu automatically; add this line to $MENU:"
+    echo "$MENU_ENTRY"
+  fi
+  rm -f "$tmp"
+}
+
+cmd_setup() {
+  cmd_build
+
+  cat >"$HYPR_STUB" <<'EOF'
+-- Window title bars from the Title Bars Omarchy plugin (marcho78.titlebars).
+-- Written by `titlebars setup`. Run `titlebars uninstall` to turn them off.
+local plugin = os.getenv("HOME") .. "/.config/omarchy/plugins/marcho78.titlebars"
+local module = plugin .. "/hypr/titlebars.lua"
+local file = io.open(module, "r")
+if file then
+  file:close()
+  -- Keep plugin problems from breaking the rest of the Hyprland config.
+  local chunk, problem = loadfile(module)
+  local ok = chunk ~= nil
+  if ok then
+    ok, problem = pcall(chunk, plugin)
+  end
+  if not ok then
+    hl.notification.create({ text = "Title Bars: " .. tostring(problem), duration = 10000, icon = "error" })
+  end
+end
+EOF
+
+  if ! grep -qF "$REQUIRE_LINE" "$HYPR_CONFIG"; then
+    cp "$HYPR_CONFIG" "$HYPR_CONFIG.bak.$(date +%s)"
+    if grep -q '^require("hypr.autostart")' "$HYPR_CONFIG"; then
+      sed -i "/^require(\"hypr.autostart\")/a $REQUIRE_LINE" "$HYPR_CONFIG"
+    else
+      printf '\n%s\n' "$REQUIRE_LINE" >>"$HYPR_CONFIG"
+    fi
+  fi
+
+  mkdir -p "$(dirname "$HOOK")"
+  cat >"$HOOK" <<EOF
+#!/bin/bash
+# Rebuild hyprbars for Title Bars when an update brings a new Hyprland.
+titlebars="\$HOME/.config/omarchy/plugins/$PLUGIN_ID/bin/titlebars"
+[[ -x \$titlebars ]] && exec "\$titlebars" build
+EOF
+  chmod 755 "$HOOK"
+
+  add_menu_entry
+  mkdir -p "$(dirname "$CLI_LINK")"
+  ln -sfn "$PLUGIN_DIR/bin/titlebars" "$CLI_LINK"
+
+  if ! omarchy-shell shell listPlugins 2>/dev/null | jq -e --arg id "$PLUGIN_ID" '.[] | select(.id == $id and .enabled)' >/dev/null 2>&1; then
+    omarchy plugin enable "$PLUGIN_ID" >/dev/null 2>&1 || true
+  fi
+
+  reload_hyprland
+  echo "Title bars are on. Customize them from Omarchy menu > Style > Title Bars, or run \`titlebars settings\`."
+}
+
+cmd_uninstall() {
+  if [[ -f $HYPR_CONFIG ]] && grep -qF "$REQUIRE_LINE" "$HYPR_CONFIG"; then
+    cp "$HYPR_CONFIG" "$HYPR_CONFIG.bak.$(date +%s)"
+    sed -i "\#^$REQUIRE_LINE\$#d" "$HYPR_CONFIG"
+  fi
+  rm -f "$HYPR_STUB" "$HOOK"
+  [[ -L $CLI_LINK ]] && rm -f "$CLI_LINK"
+  if [[ -f $MENU ]] && grep -q '"style.titlebars"' "$MENU"; then
+    sed -i '/"style.titlebars"/d' "$MENU"
+  fi
+  if [[ ${1:-} == "--purge" ]]; then
+    rm -rf "$SETTINGS" "$BUILD_DIR"
+  fi
+
+  reload_hyprland
+  echo "Title bars are off. Hyprland unloads hyprbars on the next login."
+}
+
+cmd_status() {
+  local hyprland_commit built="not built" loaded="no" hooked="no"
+  hyprland_commit=$(sed -n 's/^#define GIT_COMMIT_HASH *"\([0-9a-f]*\)".*/\1/p' "$HYPRLAND_VERSION_H" 2>/dev/null || true)
+  if [[ -f $BUILD_PLUGIN ]]; then
+    built="built for another Hyprland (run \`titlebars build\`)"
+    [[ $(cat "$BUILD_STAMP" 2>/dev/null) == "$hyprland_commit" ]] && built="built for Hyprland $(pkg-config --modversion hyprland)"
+  fi
+  hyprctl plugin list 2>/dev/null | grep -q '^Plugin hyprbars' && loaded="yes"
+  grep -qF "$REQUIRE_LINE" "$HYPR_CONFIG" 2>/dev/null && [[ -f $HYPR_STUB ]] && hooked="yes"
+
+  echo "hyprbars:  $built"
+  echo "loaded:    $loaded"
+  echo "hooked up: $hooked"
+  echo "settings:  $([[ -s $SETTINGS ]] && echo "$SETTINGS" || echo "defaults")"
+}
+
+command="${1:-}"
+shift || true
+case $command in
+settings | open) cmd_settings "$@" ;;
+set) cmd_set "$@" ;;
+get) cmd_get "$@" ;;
+reset) cmd_reset ;;
+status) cmd_status ;;
+setup) cmd_setup ;;
+build) cmd_build "$@" ;;
+uninstall) cmd_uninstall "$@" ;;
+"" | -h | --help | help) usage ;;
+*)
+  usage >&2
+  exit 1
+  ;;
+esac

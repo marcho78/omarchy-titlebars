@@ -1,0 +1,17 @@
+{
+  "choices": {
+    "style": ["dots", "labeled", "mono", "symbols", "nerd"],
+    "buttons": ["right", "left"],
+    "order": ["standard", "mac"],
+    "titleAlign": ["center", "left"],
+    "titleWeight": ["light", "normal", "medium", "semibold", "bold"],
+    "doubleClick": ["maximize", "minimize", "none"]
+  },
+  "ranges": {
+    "buttonSize": [8, 24],
+    "buttonSpacing": [0, 24],
+    "titleSize": [8, 24],
+    "barHeight": [16, 48],
+    "barPadding": [0, 48]
+  }
+}
