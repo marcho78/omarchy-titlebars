@@ -10,7 +10,7 @@ import "Styles.js" as Styles
 // Open it from Omarchy menu > Style > Title Bars, `titlebars settings`, or
 //   omarchy-shell shell summon marcho78.titlebars '{}'
 //
-// Changes are written to ~/.config/omarchy/titlebars.json (only the values
+// Changes are written to ~/.config/omarchy/marcho78.titlebars.json (only the values
 // that differ from defaults.json) and Hyprland reloads to apply them.
 Item {
   id: root

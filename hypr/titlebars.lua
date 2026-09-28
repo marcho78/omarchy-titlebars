@@ -2,7 +2,7 @@
 --
 -- Draws window title bars with minimize / maximize / close buttons through the
 -- hyprbars plugin (https://github.com/hyprwm/hyprland-plugins). The look comes
--- from this plugin's defaults.json with ~/.config/omarchy/titlebars.json on
+-- from this plugin's defaults.json with ~/.config/omarchy/marcho78.titlebars.json on
 -- top; the Title Bars panel and the `titlebars` command edit that file and
 -- reload Hyprland.
 --
@@ -12,7 +12,7 @@
 local plugin_dir = ...
 local paths = require("default.hypr.paths")
 
-local hyprbars_path = paths.home .. "/.local/share/hyprbars/hyprbars.so"
+local hyprbars_path = paths.home .. "/.local/share/marcho78.titlebars/hyprbars.so"
 local max_state_bytes = 256 * 1024
 local minimized_workspace = "special:minimized"
 

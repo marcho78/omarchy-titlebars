@@ -63,24 +63,24 @@ class Settings(Base):
         self.assertEqual(self.run_cli("set", "buttons", "left").returncode, 0)
         self.assertEqual(self.run_cli("set", "colors.close", "#ff0000").returncode, 0)
         self.assertEqual(self.run_cli("set", "buttons", "right").returncode, 0)
-        self.assertEqual(json.loads(self.read(".config/omarchy/titlebars.json")), {"colors": {"close": "#ff0000"}})
+        self.assertEqual(json.loads(self.read(".config/omarchy/marcho78.titlebars.json")), {"colors": {"close": "#ff0000"}})
 
     def test_invalid_values_are_refused(self):
         for key, value in [("buttonSize", "30"), ("title", "maybe"), ("style", "evil"), ("colors.close", "x;rm"),
                            ("colors.close", "tomato"), ("noBarApps", "a`b"), ("nope", "1"), ("colors", "red")]:
             with self.subTest(key=key, value=value):
                 self.assertNotEqual(self.run_cli("set", key, value).returncode, 0)
-        self.assertFalse(os.path.exists(self.path(".config/omarchy/titlebars.json")))
+        self.assertFalse(os.path.exists(self.path(".config/omarchy/marcho78.titlebars.json")))
 
     def test_save_validates_everything(self):
         self.assertEqual(self.run_cli("save", '{"style":"nerd"}').returncode, 0)
         self.assertNotEqual(self.run_cli("save", '{"style":"nerd","titleFont":"a\\u0000b"}').returncode, 0)
         self.assertNotEqual(self.run_cli("save", "[1]").returncode, 0)
         self.assertNotEqual(self.run_cli("save", "x" * 70000).returncode, 0)
-        self.assertEqual(json.loads(self.read(".config/omarchy/titlebars.json")), {"style": "nerd"})
+        self.assertEqual(json.loads(self.read(".config/omarchy/marcho78.titlebars.json")), {"style": "nerd"})
 
     def test_load_reports_a_broken_file_instead_of_failing(self):
-        self.write(".config/omarchy/titlebars.json", "{nope")
+        self.write(".config/omarchy/marcho78.titlebars.json", "{nope")
         result = self.run_cli("load")
         self.assertEqual(result.returncode, 0)
         loaded = json.loads(result.stdout)
@@ -98,7 +98,7 @@ class HyprState(Base):
             raise AssertionError("titlebars hypr must not run programs: %r" % (args,))
 
         cli.run = no_processes
-        self.write(".config/omarchy/titlebars.json", '{"buttons": "left", "style": "evil", "barHeight": 999}')
+        self.write(".config/omarchy/marcho78.titlebars.json", '{"buttons": "left", "style": "evil", "barHeight": 999}')
         import contextlib
         import io
         out = io.StringIO()
@@ -119,7 +119,7 @@ class HyprState(Base):
 class Refusals(Base):
     def test_symlinked_settings_file(self):
         self.write("secret", "SECRET")
-        os.symlink(self.path("secret"), self.path(".config/omarchy/titlebars.json"))
+        os.symlink(self.path("secret"), self.path(".config/omarchy/marcho78.titlebars.json"))
         self.assertNotEqual(self.run_cli("get").returncode, 0)
         self.assertNotEqual(self.run_cli("set", "buttons", "left").returncode, 0)
         self.assertEqual(self.read("secret"), "SECRET")
@@ -135,15 +135,15 @@ class Refusals(Base):
         self.assertNotEqual(self.run_cli("set", "buttons", "left").returncode, 0)
 
     def test_oversized_and_hardlinked_files(self):
-        self.write(".config/omarchy/titlebars.json", " " * 70000)
+        self.write(".config/omarchy/marcho78.titlebars.json", " " * 70000)
         self.assertNotEqual(self.run_cli("get").returncode, 0)
-        os.unlink(self.path(".config/omarchy/titlebars.json"))
+        os.unlink(self.path(".config/omarchy/marcho78.titlebars.json"))
         self.write("other.json", "{}")
-        os.link(self.path("other.json"), self.path(".config/omarchy/titlebars.json"))
+        os.link(self.path("other.json"), self.path(".config/omarchy/marcho78.titlebars.json"))
         self.assertNotEqual(self.run_cli("get").returncode, 0)
 
     def test_fifo_does_not_hang(self):
-        os.mkfifo(self.path(".config/omarchy/titlebars.json"))
+        os.mkfifo(self.path(".config/omarchy/marcho78.titlebars.json"))
         self.assertNotEqual(self.run_cli("get").returncode, 0)
 
 
@@ -152,15 +152,89 @@ class Setup(Base):
         cli = self.cli
         hdir = cli.open_dir(cli.HYPR_DIR)
         try:
-            self.assertTrue(cli.edit_text_file(hdir, cli.HYPR_CONFIG, cli.add_require))
-            self.assertFalse(cli.edit_text_file(hdir, cli.HYPR_CONFIG, cli.add_require))
+            add = lambda text: cli.add_require(text, False)
+            self.assertTrue(cli.edit_text_file(hdir, cli.HYPR_CONFIG, add))
+            self.assertFalse(cli.edit_text_file(hdir, cli.HYPR_CONFIG, add))
         finally:
             os.close(hdir)
         lines = self.read(".config/hypr/hyprland.lua").splitlines()
         self.assertEqual(lines[2], cli.REQUIRE_LINE)
         self.assertEqual(lines.count(cli.REQUIRE_LINE), 1)
-        self.assertIsNone(cli.add_require("\n".join(lines)))
-        self.assertNotIn(cli.REQUIRE_LINE, cli.remove_require("\n".join(lines) + "\n"))
+        self.assertIsNone(cli.add_require("\n".join(lines), False))
+        self.assertNotIn(cli.REQUIRE_LINE, cli.remove_require("\n".join(lines) + "\n", False))
+
+    def test_a_require_line_someone_else_wrote_is_left_alone(self):
+        cli = self.cli
+        theirs = 'require("hypr.autostart")\nrequire("hypr.titlebars")\n'
+        with self.assertRaises(cli.Refused):
+            cli.add_require(theirs, False)
+        self.assertEqual(cli.remove_require(theirs, False), theirs)
+        # The first release wrote the unmarked line next to its own stub: migrate it.
+        migrated = cli.add_require(theirs, True)
+        self.assertIn(cli.REQUIRE_LINE, migrated)
+        self.assertNotIn(cli.LEGACY_REQUIRE_LINE + "\n", migrated)
+
+    def test_setup_and_uninstall_never_touch_files_they_didnt_write(self):
+        cli = self.cli
+        hook_rel = ".config/omarchy/hooks/post-update.d/titlebars.hook"
+        os.makedirs(self.path(".config/omarchy/hooks/post-update.d"), mode=0o700)
+        self.write(".config/hypr/titlebars.lua", "-- my own file\n")
+        self.write(hook_rel, "#!/bin/bash\necho mine\n")
+        hdir = cli.open_dir(cli.HYPR_DIR)
+        kdir = cli.open_dir(cli.HOOK_DIR)
+        try:
+            with self.assertRaises(cli.Refused):
+                cli.write_owned(hdir, cli.HYPR_STUB, cli.STUB, 0o644, "stub")
+            with self.assertRaises(cli.Refused):
+                cli.write_owned(kdir, cli.HOOK_FILE, cli.HOOK, 0o755, "hook")
+            cli.remove_owned(hdir, cli.HYPR_STUB, "stub")
+            cli.remove_owned(kdir, cli.HOOK_FILE, "hook")
+            self.assertEqual(self.read(".config/hypr/titlebars.lua"), "-- my own file\n")
+            self.assertEqual(self.read(hook_rel), "#!/bin/bash\necho mine\n")
+            # Ours (current or first-release header) is replaced and removed.
+            for name, text, legacy in ((cli.HYPR_STUB, cli.STUB, "-- Window title bars from the Title Bars Omarchy plugin (marcho78.titlebars).\n"),
+                                       (cli.HOOK_FILE, cli.HOOK, "#!/bin/bash\n# Rebuild hyprbars for Title Bars when an update brings a new Hyprland.\n")):
+                dfd = hdir if name == cli.HYPR_STUB else kdir
+                cli.write_file(dfd, name, legacy.encode())
+                cli.write_owned(dfd, name, text, 0o644, name)
+                self.assertEqual(cli.file_state(dfd, name), "ours")
+                cli.remove_owned(dfd, name, name)
+                self.assertEqual(cli.file_state(dfd, name), "missing")
+        finally:
+            os.close(hdir)
+            os.close(kdir)
+
+    def test_menu_entries_someone_else_wrote_are_left_alone(self):
+        cli = self.cli
+        theirs = '{\n  "style.titlebars": {"label": "Mine", "action": "foo"},\n}\n'
+        self.assertIsNone(cli.add_menu(theirs))
+        self.assertEqual(cli.remove_menu(theirs), theirs)
+
+    def test_purge_removes_only_files_it_created(self):
+        cli = self.cli
+        build = ".local/share/marcho78.titlebars"
+        os.makedirs(self.path(build), mode=0o700)
+        for name in cli.BUILD_FILES:
+            self.write(f"{build}/{name}", "x")
+        cli.remove_known_files(cli.BUILD_DIR, cli.BUILD_FILES)
+        self.assertFalse(os.path.exists(self.path(build)))
+        os.makedirs(self.path(build), mode=0o700)
+        self.write(f"{build}/hyprbars.so", "x")
+        self.write(f"{build}/notes.txt", "mine")
+        cli.remove_known_files(cli.BUILD_DIR, cli.BUILD_FILES)
+        self.assertEqual(os.listdir(self.path(build)), ["notes.txt"])
+
+    def test_legacy_settings_move_only_when_they_are_ours(self):
+        cli = self.cli
+        self.write(".config/omarchy/titlebars.json", '{"buttons": "left"}')
+        cli.migrate_settings()
+        self.assertFalse(os.path.exists(self.path(".config/omarchy/titlebars.json")))
+        self.assertEqual(json.loads(self.read(".config/omarchy/marcho78.titlebars.json")), {"buttons": "left"})
+        os.unlink(self.path(".config/omarchy/marcho78.titlebars.json"))
+        self.write(".config/omarchy/titlebars.json", '{"someone": "else"}')
+        cli.migrate_settings()
+        self.assertEqual(self.read(".config/omarchy/titlebars.json"), '{"someone": "else"}')
+        self.assertFalse(os.path.exists(self.path(".config/omarchy/marcho78.titlebars.json")))
 
     def test_menu_entry_keeps_the_file_valid(self):
         cli = self.cli
@@ -239,7 +313,7 @@ class OfferSetup(Base):
             answers.append(out.getvalue().strip())
         self.assertEqual(answers, ["yes", "no"])
         cli.status = lambda: {"built": True, "hooked": True}
-        os.unlink(self.path(".local/state/titlebars/setup-offered"))
+        os.unlink(self.path(".local/state/marcho78.titlebars/setup-offered"))
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             cli.cmd_offer_setup([])

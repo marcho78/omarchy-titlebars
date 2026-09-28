@@ -4,7 +4,7 @@
 local plugin_dir = arg[0]:match("^(.*)/tests/[^/]+$") or "."
 
 local home = io.popen("mktemp -d"):read("l")
-os.execute("mkdir -p '" .. home .. "/.config/omarchy' '" .. home .. "/.local/state/omarchy/current/theme' '" .. home .. "/.local/share/hyprbars'")
+os.execute("mkdir -p '" .. home .. "/.config/omarchy' '" .. home .. "/.local/state/omarchy/current/theme' '" .. home .. "/.local/share/marcho78.titlebars'")
 
 local function write(path, text)
   local file = assert(io.open(path, "w"))
@@ -14,9 +14,9 @@ end
 
 local harness = {
   plugin_dir = plugin_dir,
-  settings_path = home .. "/.config/omarchy/titlebars.json",
-  plugin_path = home .. "/.local/share/hyprbars/hyprbars.so",
-  features_path = home .. "/.local/share/hyprbars/features",
+  settings_path = home .. "/.config/omarchy/marcho78.titlebars.json",
+  plugin_path = home .. "/.local/share/marcho78.titlebars/hyprbars.so",
+  features_path = home .. "/.local/share/marcho78.titlebars/features",
   colors_path = home .. "/.local/state/omarchy/current/theme/colors.toml",
 }
 

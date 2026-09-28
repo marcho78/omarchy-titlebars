@@ -63,9 +63,12 @@ PYTHON = "/usr/bin/python3"
 VERSION_H = "/usr/include/hyprland/src/version.h"
 
 SETTINGS_DIR = (".config", "omarchy")
-SETTINGS_FILE = "titlebars.json"
+SETTINGS_FILE = PLUGIN_ID + ".json"
+LEGACY_SETTINGS_FILE = "titlebars.json"
 THEME_DIR = (".local", "state", "omarchy", "current", "theme")
-BUILD_DIR = (".local", "share", "hyprbars")
+BUILD_DIR = (".local", "share", PLUGIN_ID)
+STATE_DIR = (".local", "state", PLUGIN_ID)
+BUILD_FILES = ("hyprbars.so", "features", "built-for-hyprland")
 HYPR_DIR = (".config", "hypr")
 HOOK_DIR = (".config", "omarchy", "hooks", "post-update.d")
 MENU_DIR = (".config", "omarchy", "extensions")
@@ -73,13 +76,25 @@ BIN_DIR = (".local", "bin")
 
 HYPR_CONFIG = "hyprland.lua"
 HYPR_STUB = "titlebars.lua"
-REQUIRE_LINE = 'require("hypr.titlebars")'
+# Everything setup writes carries this mark; nothing without it is replaced or removed.
+OWNER_MARK = "Managed by marcho78.titlebars"
+REQUIRE_LINE = 'require("hypr.titlebars") -- ' + OWNER_MARK
+# Written by the first release (a48d33e), before the mark existed.
+LEGACY_REQUIRE_LINE = 'require("hypr.titlebars")'
+LEGACY_MARKS = (
+    "Window title bars from the Title Bars Omarchy plugin (marcho78.titlebars).",
+    "# Rebuild hyprbars for Title Bars when an update brings a new Hyprland.",
+)
 HOOK_FILE = "titlebars.hook"
 MENU_FILE = "omarchy-menu.jsonc"
 MENU_KEY = '"style.titlebars"'
 MENU_ENTRY = (
     '  "style.titlebars": {"icon":"\U000F05AF","label":"Title Bars",'
     f'"action":"{OMARCHY_SHELL} shell summon {PLUGIN_ID} \'{{}}\'"}},'
+)
+LEGACY_MENU_ENTRY = (
+    '  "style.titlebars": {"icon":"\U000F05AF","label":"Title Bars",'
+    f'"action":"omarchy-shell shell summon {PLUGIN_ID} \'{{}}\'"}},'
 )
 PAGES = ("buttons", "title", "colors", "bar", "behavior")
 
@@ -426,6 +441,32 @@ def write_settings(changes):
         os.close(dfd)
 
 
+def migrate_settings():
+    """Move settings from the first release's unnamespaced file, but only a file
+    that is plainly ours: a JSON object holding nothing but Title Bars settings."""
+    defaults, _schema = load_spec()
+    dfd = open_dir(SETTINGS_DIR)
+    if dfd is None:
+        return
+    try:
+        if read_file(dfd, SETTINGS_FILE, MAX_SETTINGS) is not None:
+            return
+        data = read_file(dfd, LEGACY_SETTINGS_FILE, MAX_SETTINGS)
+        if data is None:
+            return
+        try:
+            raw = json.loads(data)
+        except (ValueError, UnicodeDecodeError):
+            raw = None
+        if not isinstance(raw, dict) or not set(raw) <= set(defaults):
+            say(f"Note: left {HOME}/.config/omarchy/{LEGACY_SETTINGS_FILE} alone; it doesn't look like Title Bars settings.")
+            return
+        write_file(dfd, SETTINGS_FILE, data)
+        os.unlink(LEGACY_SETTINGS_FILE, dir_fd=dfd)
+    finally:
+        os.close(dfd)
+
+
 def merged(defaults, changes):
     settings = json.loads(json.dumps(defaults))
     for key, value in changes.items():
@@ -592,8 +633,9 @@ def status():
     if hdir is not None:
         try:
             config = read_file(hdir, HYPR_CONFIG, MAX_CONFIG_FILE) or b""
-            lines = config.decode("utf-8", "replace").splitlines()
-            hooked = any(line.strip() == REQUIRE_LINE for line in lines) and read_file(hdir, HYPR_STUB, 64 * KiB) is not None
+            lines = [line.strip() for line in config.decode("utf-8", "replace").splitlines()]
+            stub_ours = file_state(hdir, HYPR_STUB) == "ours"
+            hooked = stub_ours and (REQUIRE_LINE in lines or LEGACY_REQUIRE_LINE in lines)
         finally:
             os.close(hdir)
     loaded = False
@@ -654,7 +696,7 @@ def cmd_offer_setup(_args):
     if state["built"] and state["hooked"]:
         say("no")
         return
-    sdir = open_dir((".local", "state", "titlebars"), create=True)
+    sdir = open_dir(STATE_DIR, create=True)
     try:
         try:
             os.stat("setup-offered", dir_fd=sdir, follow_symlinks=False)
@@ -751,16 +793,12 @@ def cmd_build(args):
 
     bdir = open_dir(BUILD_DIR, create=True)
     work = "build-" + secrets.token_hex(6)
+    created = None
     try:
-        # Checkouts left by older versions of this plugin.
-        for old in ("hyprland-plugins",):
-            try:
-                if stat.S_ISDIR(os.stat(old, dir_fd=bdir, follow_symlinks=False).st_mode):
-                    shutil.rmtree(old, dir_fd=bdir)
-            except FileNotFoundError:
-                pass
         os.mkdir(work, 0o700, dir_fd=bdir)
         wfd = os.open(work, DIR_FLAGS, dir_fd=bdir)
+        wst = os.fstat(wfd)
+        created = (wst.st_dev, wst.st_ino)
         try:
             for name, data in files.items():
                 write_file(wfd, name, data)
@@ -783,8 +821,11 @@ def cmd_build(args):
         write_file(bdir, "built-for-hyprland", (" ".join(wanted) + "\n").encode())
         say(f"Installed hyprbars for Hyprland {version}")
     finally:
+        # Remove only the directory this run created, never one swapped in by name.
         try:
-            shutil.rmtree(work, dir_fd=bdir)
+            st = os.stat(work, dir_fd=bdir, follow_symlinks=False)
+            if created and stat.S_ISDIR(st.st_mode) and (st.st_dev, st.st_ino) == created:
+                shutil.rmtree(work, dir_fd=bdir)
         except FileNotFoundError:
             pass
         os.close(bdir)
@@ -792,9 +833,9 @@ def cmd_build(args):
 
 # Setup and uninstall ------------------------------------------------------------------------------------
 
-STUB = """-- Window title bars from the Title Bars Omarchy plugin (marcho78.titlebars).
--- Written by `titlebars setup`. Run `titlebars uninstall` to turn them off.
-local plugin = os.getenv("HOME") .. "/.config/omarchy/plugins/marcho78.titlebars"
+STUB = f"""-- {OWNER_MARK}: window title bars from the Title Bars Omarchy plugin.
+-- Written by `titlebars setup`; `titlebars uninstall` removes this file.
+local plugin = os.getenv("HOME") .. "/.config/omarchy/plugins/{PLUGIN_ID}"
 local module = plugin .. "/hypr/titlebars.lua"
 local file = io.open(module, "r")
 if file then
@@ -806,13 +847,14 @@ if file then
     ok, problem = pcall(chunk, plugin)
   end
   if not ok then
-    hl.notification.create({ text = "Title Bars: " .. tostring(problem), duration = 10000, icon = "error" })
+    hl.notification.create({{ text = "Title Bars: " .. tostring(problem), duration = 10000, icon = "error" }})
   end
 end
 """
 
 HOOK = f"""#!/bin/bash
-# Rebuild hyprbars for Title Bars when an update brings a new Hyprland.
+# {OWNER_MARK}: rebuilds hyprbars when an update brings a new Hyprland.
+# Written by `titlebars setup`; `titlebars uninstall` removes this file.
 titlebars="$HOME/.config/omarchy/plugins/{PLUGIN_ID}/bin/titlebars"
 [[ -f $titlebars ]] && exec {PYTHON} -I "$titlebars" build
 """
@@ -831,6 +873,48 @@ def menu_valid(text):
         return False
 
 
+def owned_text(data):
+    head = data[:1024].decode("utf-8", "replace")
+    return OWNER_MARK in head or any(mark in head for mark in LEGACY_MARKS)
+
+
+def file_state(dfd, name):
+    """"missing", "ours" (carries our mark), or "foreign"."""
+    data = read_file(dfd, name, 256 * KiB)
+    if data is None:
+        return "missing"
+    return "ours" if owned_text(data) else "foreign"
+
+
+def write_owned(dfd, name, text, mode, where):
+    if file_state(dfd, name) == "foreign":
+        raise Refused(f"{where} exists and wasn't written by Title Bars; move it aside and run setup again")
+    write_file(dfd, name, text.encode(), mode=mode)
+
+
+def remove_owned(dfd, name, where):
+    state = file_state(dfd, name)
+    if state == "ours":
+        os.unlink(name, dir_fd=dfd)
+    elif state == "foreign":
+        say(f"Note: left {where} alone; Title Bars didn't write it.")
+
+
+def write_new_file(dfd, name, data):
+    """Create a file that must not exist yet (backups never replace anything)."""
+    for suffix in [""] + [f".{i}" for i in range(1, 100)]:
+        try:
+            fd = os.open(name + suffix, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+        except FileExistsError:
+            continue
+        with os.fdopen(fd, "wb") as out:
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+        return name + suffix
+    raise Refused(f"too many backups named {name}")
+
+
 def edit_text_file(dfd, name, edit, mode_default=0o644, backup=False):
     data = read_file(dfd, name, MAX_CONFIG_FILE)
     old = data.decode("utf-8") if data is not None else None
@@ -838,7 +922,7 @@ def edit_text_file(dfd, name, edit, mode_default=0o644, backup=False):
     if new is None or new == old:
         return False
     if backup and old is not None:
-        write_file(dfd, f"{name}.bak.{int(time.time())}", data, mode=0o600)
+        write_new_file(dfd, f"{name}.bak.{int(time.time())}", data)
     mode = mode_default
     if data is not None:
         mode = stat.S_IMODE(os.stat(name, dir_fd=dfd, follow_symlinks=False).st_mode) & 0o755
@@ -846,12 +930,16 @@ def edit_text_file(dfd, name, edit, mode_default=0o644, backup=False):
     return True
 
 
-def add_require(text):
+def add_require(text, legacy_ours):
     if text is None:
         raise Refused(f"{HOME}/.config/hypr/{HYPR_CONFIG} doesn't exist")
     lines = text.splitlines(keepends=True)
     if any(line.strip() == REQUIRE_LINE for line in lines):
         return None
+    if any(line.strip() == LEGACY_REQUIRE_LINE for line in lines):
+        if not legacy_ours:
+            raise Refused(f"{HYPR_CONFIG} already requires hypr.titlebars, and Title Bars didn't add it; left it alone")
+        return "".join(REQUIRE_LINE + "\n" if line.strip() == LEGACY_REQUIRE_LINE else line for line in lines)
     for i, line in enumerate(lines):
         if line.strip() == 'require("hypr.autostart")':
             lines.insert(i + 1, REQUIRE_LINE + "\n")
@@ -859,17 +947,24 @@ def add_require(text):
     return text + ("" if text.endswith("\n") else "\n") + "\n" + REQUIRE_LINE + "\n"
 
 
-def remove_require(text):
+def remove_require(text, legacy_ours):
     if text is None:
         return None
-    return "".join(line for line in text.splitlines(keepends=True) if line.strip() != REQUIRE_LINE)
+    ours = {REQUIRE_LINE} | ({LEGACY_REQUIRE_LINE} if legacy_ours else set())
+    return "".join(line for line in text.splitlines(keepends=True) if line.strip() not in ours)
+
+
+OUR_MENU_LINES = {MENU_ENTRY.strip(), LEGACY_MENU_ENTRY.strip()}
 
 
 def add_menu(text):
     if text is None:
         return "{\n" + MENU_ENTRY + "\n}\n"
     lines = text.splitlines(keepends=True)
-    kept = [line for line in lines if MENU_KEY not in line]
+    if any(MENU_KEY in line and line.strip() not in OUR_MENU_LINES for line in lines):
+        say(f"Note: {MENU_FILE} already has a style.titlebars entry Title Bars didn't write; left it alone.")
+        return None
+    kept = [line for line in lines if line.strip() not in OUR_MENU_LINES]
     for i, line in enumerate(kept):
         if line.lstrip().startswith("{"):
             new = "".join(kept[: i + 1] + [MENU_ENTRY + "\n"] + kept[i + 1:])
@@ -882,7 +977,7 @@ def add_menu(text):
 def remove_menu(text):
     if text is None:
         return None
-    new = "".join(line for line in text.splitlines(keepends=True) if MENU_KEY not in line)
+    new = "".join(line for line in text.splitlines(keepends=True) if line.strip() not in OUR_MENU_LINES)
     return new if menu_valid(new) else None
 
 
@@ -933,19 +1028,21 @@ def enable_plugin():
 
 def cmd_setup(_args):
     cmd_build([])
+    migrate_settings()
 
     hdir = open_dir(HYPR_DIR)
     if hdir is None:
         raise Refused(f"{HOME}/.config/hypr doesn't exist")
     try:
-        write_file(hdir, HYPR_STUB, STUB.encode(), mode=0o644)
-        edit_text_file(hdir, HYPR_CONFIG, add_require, backup=True)
+        stub_ours = file_state(hdir, HYPR_STUB) == "ours"
+        write_owned(hdir, HYPR_STUB, STUB, 0o644, f"{HOME}/.config/hypr/{HYPR_STUB}")
+        edit_text_file(hdir, HYPR_CONFIG, lambda text: add_require(text, stub_ours), backup=True)
     finally:
         os.close(hdir)
 
     kdir = open_dir(HOOK_DIR, create=True)
     try:
-        write_file(kdir, HOOK_FILE, HOOK.encode(), mode=0o755)
+        write_owned(kdir, HOOK_FILE, HOOK, 0o755, f"{HOME}/.config/omarchy/hooks/post-update.d/{HOOK_FILE}")
     finally:
         os.close(kdir)
 
@@ -961,6 +1058,32 @@ def cmd_setup(_args):
     say("Title bars are on. Customize them from Omarchy menu > Style > Title Bars, or run `titlebars settings`.")
 
 
+def remove_dir_if_empty(rel):
+    pdir = open_dir(rel[:-1])
+    if pdir is None:
+        return
+    try:
+        os.rmdir(rel[-1], dir_fd=pdir)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        say(f"Note: left {HOME}/{'/'.join(rel)} in place; it has files Title Bars didn't create.")
+    finally:
+        os.close(pdir)
+
+
+def remove_known_files(rel, names):
+    dfd = open_dir(rel)
+    if dfd is None:
+        return
+    try:
+        for name in names:
+            remove_file(dfd, name)
+    finally:
+        os.close(dfd)
+    remove_dir_if_empty(rel)
+
+
 def cmd_uninstall(args):
     purge = args == ["--purge"]
     if args and not purge:
@@ -969,14 +1092,15 @@ def cmd_uninstall(args):
     hdir = open_dir(HYPR_DIR)
     if hdir is not None:
         try:
-            edit_text_file(hdir, HYPR_CONFIG, remove_require, backup=True)
-            remove_file(hdir, HYPR_STUB)
+            stub_ours = file_state(hdir, HYPR_STUB) == "ours"
+            edit_text_file(hdir, HYPR_CONFIG, lambda text: remove_require(text, stub_ours), backup=True)
+            remove_owned(hdir, HYPR_STUB, f"{HOME}/.config/hypr/{HYPR_STUB}")
         finally:
             os.close(hdir)
     kdir = open_dir(HOOK_DIR)
     if kdir is not None:
         try:
-            remove_file(kdir, HOOK_FILE)
+            remove_owned(kdir, HOOK_FILE, f"{HOME}/.config/omarchy/hooks/post-update.d/{HOOK_FILE}")
         finally:
             os.close(kdir)
     mdir = open_dir(MENU_DIR)
@@ -988,16 +1112,10 @@ def cmd_uninstall(args):
     unlink_cli()
 
     if purge:
+        # Only files Title Bars creates, by name, in directories named after it.
         write_settings({})
-        bdir = open_dir(BUILD_DIR[:-1])
-        if bdir is not None:
-            try:
-                if stat.S_ISDIR(os.stat(BUILD_DIR[-1], dir_fd=bdir, follow_symlinks=False).st_mode):
-                    shutil.rmtree(BUILD_DIR[-1], dir_fd=bdir)
-            except FileNotFoundError:
-                pass
-            finally:
-                os.close(bdir)
+        remove_known_files(BUILD_DIR, BUILD_FILES)
+        remove_known_files(STATE_DIR, ("setup-offered",))
 
     reload_hyprland()
     say("Title bars are off. Hyprland unloads hyprbars at the next login.")

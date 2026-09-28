@@ -101,7 +101,7 @@ titlebars reset
 | `settingsButton` | `true` | `on`, `off` (a gear on the far side of the bar that opens these settings) |
 | `enabled` | `true` | `on`, `off` |
 
-Your choices are saved in `~/.config/omarchy/titlebars.json`, which only keeps
+Your choices are saved in `~/.config/omarchy/marcho78.titlebars.json`, which only keeps
 what differs from `defaults.json`. Custom colors apply while `followTheme` is off;
 picking a color in the panel turns it off for you.
 
@@ -166,14 +166,26 @@ a byte cap, so no file can stall the compositor. Title Bars writes only:
 
 | Path | What |
 |---|---|
-| `~/.config/omarchy/titlebars.json` | your settings, only what differs from the defaults |
-| `~/.local/share/hyprbars/` | the built `hyprbars.so` and a record of what it was built from |
-| `~/.local/state/titlebars/setup-offered` | marks that the panel has offered setup once |
+| `~/.config/omarchy/marcho78.titlebars.json` | your settings, only what differs from the defaults |
+| `~/.local/share/marcho78.titlebars/` | `hyprbars.so`, `features`, `built-for-hyprland` |
+| `~/.local/state/marcho78.titlebars/setup-offered` | marks that the panel has offered setup once |
 | `~/.config/hypr/titlebars.lua` | a loader for `hypr/titlebars.lua` |
-| `~/.config/hypr/hyprland.lua` | one `require("hypr.titlebars")` line (with a timestamped backup) |
+| `~/.config/hypr/hyprland.lua` | one `require("hypr.titlebars") -- Managed by marcho78.titlebars` line (with a backup that never replaces an existing file) |
 | `~/.config/omarchy/hooks/post-update.d/titlebars.hook` | the rebuild hook |
 | `~/.config/omarchy/extensions/omarchy-menu.jsonc` | the Style › Title Bars entry |
-| `~/.local/bin/titlebars` | a link to `bin/titlebars`, never replacing a file that isn't ours |
+| `~/.local/bin/titlebars` | a link to `bin/titlebars` |
+
+**Ownership.** Title Bars only replaces or removes what it wrote. The loader
+and the hook start with a `Managed by marcho78.titlebars` line; if a file at
+either path lacks it, setup stops and uninstall leaves it in place. In
+`hyprland.lua` and the menu file only the exact lines Title Bars adds are
+touched, so your own `require("hypr.titlebars")` or `style.titlebars` entry
+is left alone. The link in `~/.local/bin` is replaced or removed only while it
+points at this plugin. `uninstall --purge` deletes the settings file and the
+named files in the two `marcho78.titlebars` directories above, then removes
+those directories only if they are empty; nothing is deleted recursively. The
+temporary build directory is removed only if it is still the one the build
+created.
 
 **Input and text.** Settings are validated against `schema.json` (types,
 choices, ranges, string lengths and characters) by `bin/titlebars` before they
@@ -181,7 +193,7 @@ are stored or used. Every text element in the panel is `Text.PlainText`, and
 window classes and font names shown in it are filtered to plain characters.
 
 **Limits.** Anything running as your user can replace
-`~/.local/share/hyprbars/hyprbars.so` or edit your Hyprland config directly;
+`~/.local/share/marcho78.titlebars/hyprbars.so` or edit your Hyprland config directly;
 Title Bars doesn't try to defend against that.
 
 ## Development
