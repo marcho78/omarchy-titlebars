@@ -23,7 +23,9 @@ Item {
   readonly property string pluginId: "marcho78.titlebars"
   readonly property string pluginDir: Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "").replace(/\/$/, "")
   readonly property string home: Quickshell.env("HOME")
-  readonly property string titlebars: pluginDir + "/bin/titlebars"
+  // Every file under $HOME is read and written by bin/titlebars, which checks
+  // ownership, refuses symlinks and oversized files, and validates settings.
+  readonly property var titlebars: ["/usr/bin/python3", "-I", pluginDir + "/bin/titlebars"]
 
   // Payload may name a page to show, e.g. { "page": "colors" }, or a color
   // to edit, e.g. { "color": "close" }.
@@ -40,8 +42,8 @@ Item {
     var alreadyOpen = window.visible
     window.visible = true
     // Opening it again brings the panel back, even from minimized or another workspace.
-    if (alreadyOpen) Quickshell.execDetached(["hyprctl", "dispatch", 'hl.dsp.focus({ window = "title:^Title Bars$" })'])
-    refreshStatus()
+    if (alreadyOpen) Quickshell.execDetached(["/usr/bin/hyprctl", "dispatch", 'hl.dsp.focus({ window = "title:^Title Bars$" })'])
+    reload()
     refreshApps()
   }
 
@@ -65,7 +67,9 @@ Item {
   property var schema: ({ choices: {}, ranges: {} })
   property var user: ({})
   property var palette: ({})
-  property string lastWritten: ""
+  property var status: ({})
+  property bool eyedropper: false
+  property string problem: ""
 
   readonly property bool ready: defaults !== null
   readonly property var settings: ready ? Styles.merge(defaults, user, schema) : ({})
@@ -73,7 +77,7 @@ Item {
   readonly property var buttons: ready ? Styles.buttons(settings, colors) : []
   readonly property bool customized: Object.keys(user).length > 0
   // The gear needs our hyprbars patch; `titlebars build` records whether it applied.
-  property bool gearAvailable: false
+  readonly property bool gearAvailable: status.gear === true
   readonly property var gear: ready && gearAvailable ? Styles.settingsButton(settings, colors) : null
 
   function range(key) {
@@ -107,9 +111,16 @@ Item {
     saveTimer.restart()
   }
 
+  function reload() {
+    if (!loader.start(titlebars.concat(["load"]))) reloadPending = true
+  }
+
+  property bool reloadPending: false
+  property bool savePending: false
+
+  // bin/titlebars validates, stores, and reloads Hyprland.
   function save() {
-    lastWritten = JSON.stringify(user, null, 2) + "\n"
-    settingsFile.setText(lastWritten)
+    if (!saver.start(titlebars.concat(["save", JSON.stringify(user)]))) savePending = true
   }
 
   Timer {
@@ -118,99 +129,76 @@ Item {
     onTriggered: root.save()
   }
 
-  FileView {
-    id: settingsFile
-    path: root.home + "/.config/omarchy/titlebars.json"
-    atomicWrites: true
-    watchChanges: true
-    printErrors: false
-    onFileChanged: reload()
-    onLoaded: {
-      var content = text()
-      // Our own write coming back, or unsaved edits that should win.
-      if (content === root.lastWritten || saveTimer.running) return
-      try {
-        var parsed = JSON.parse(content)
-        root.user = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : ({})
-      } catch (e) {
-        root.user = ({})
+  Bounded {
+    id: loader
+    maxBytes: 256 * 1024
+    timeoutMs: 20000
+    onFinished: function(ok, text) {
+      if (ok) {
+        try {
+          var state = JSON.parse(text)
+          root.schema = state.schema
+          root.palette = state.palette || ({})
+          root.status = state.status || ({})
+          root.eyedropper = state.eyedropper === true
+          root.problem = state.problem || ""
+          if (!saveTimer.running && !saver.running) root.user = state.user || ({})
+          root.defaults = state.defaults
+        } catch (e) {
+          root.problem = "Couldn't read the settings."
+        }
+      } else {
+        root.problem = "Couldn't read the settings: " + text
+      }
+      if (root.reloadPending) {
+        root.reloadPending = false
+        root.reload()
       }
     }
-    onLoadFailed: if (!saveTimer.running) root.user = ({})
-    // Reload Hyprland once the new settings are on disk.
-    onSaved: Quickshell.execDetached(["hyprctl", "reload"])
   }
 
-  FileView {
-    path: root.home + "/.local/share/hyprbars/features"
-    watchChanges: true
-    printErrors: false
-    onFileChanged: reload()
-    onLoaded: root.gearAvailable = text().indexOf("opposite") >= 0
+  Bounded {
+    id: saver
+    maxBytes: 16 * 1024
+    timeoutMs: 20000
+    onFinished: function(ok, text) {
+      root.problem = ok ? "" : "Couldn't save: " + text
+      if (root.savePending) {
+        root.savePending = false
+        root.save()
+      } else if (!ok) {
+        root.reload()
+      }
+    }
   }
 
-  FileView {
-    path: root.pluginDir + "/defaults.json"
-    printErrors: false
-    onLoaded: root.defaults = JSON.parse(text())
-  }
+  // ---- setup ------------------------------------------------------------------------
 
-  FileView {
-    path: root.pluginDir + "/schema.json"
-    printErrors: false
-    onLoaded: root.schema = JSON.parse(text())
-  }
-
-  FileView {
-    path: root.home + "/.local/state/omarchy/current/theme/colors.toml"
-    watchChanges: true
-    printErrors: false
-    onFileChanged: reload()
-    onLoaded: root.palette = Styles.parsePalette(text())
-  }
-
-  // ---- setup status ------------------------------------------------------------
-
-  property bool statusKnown: false
-  property bool built: true
-  property bool hookedUp: true
   property bool settingUp: false
   property string setupMessage: ""
-  readonly property bool needsSetup: statusKnown && (!built || !hookedUp)
-
-  function refreshStatus() {
-    statusProcess.running = false
-    statusProcess.running = true
-  }
+  readonly property bool statusKnown: status.built !== undefined
+  readonly property bool unsupported: statusKnown && status.supported === false && status.built !== true
+  readonly property bool needsSetup: statusKnown && !unsupported && (status.built !== true || status.hooked !== true)
 
   function startSetup() {
     settingUp = true
     setupMessage = "Building hyprbars for your Hyprland version. This takes a minute or two..."
-    setupProcess.running = true
+    setup.start(titlebars.concat(["setup"]))
   }
 
-  Process {
-    id: statusProcess
-    command: [root.titlebars, "status"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        root.built = /hyprbars:\s+built for Hyprland/.test(text)
-        root.hookedUp = /hooked up:\s+yes/.test(text)
-        root.statusKnown = true
-      }
+  Bounded {
+    id: setup
+    maxBytes: 1024 * 1024
+    // Cloning plus compiling; slow machines need the headroom.
+    timeoutMs: 45 * 60 * 1000
+    onChunk: function(data) {
+      var lines = data.split("\n").filter(function(line) { return line.trim() !== "" })
+      if (lines.length) root.setupMessage = lines[lines.length - 1].slice(0, 300)
     }
-  }
-
-  Process {
-    id: setupProcess
-    command: [root.titlebars, "setup"]
-    stdout: SplitParser { onRead: function(line) { if (line.trim()) root.setupMessage = line } }
-    stderr: SplitParser { onRead: function(line) { if (line.trim()) root.setupMessage = line } }
-    onExited: function(exitCode) {
+    onFinished: function(ok, text) {
       root.settingUp = false
-      if (exitCode !== 0) root.setupMessage = "Setup failed: " + root.setupMessage
-      root.refreshStatus()
+      if (!ok) root.setupMessage = "Setup failed: " + text.slice(-600)
+      root.reload()
     }
   }
 
@@ -220,43 +208,44 @@ Item {
   property var openApps: []
 
   function refreshApps() {
-    appsProcess.running = false
-    appsProcess.running = true
+    apps.start(["/usr/bin/hyprctl", "clients", "-j"])
   }
 
-  Process {
-    running: true
-    command: ["fc-list", ":", "family"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var names = {}
-        text.split("\n").forEach(function(line) {
-          var name = line.split(",")[0].trim()
-          if (name) names[name] = true
-        })
-        root.fonts = [{ value: "", label: "Omarchy font" }].concat(Object.keys(names).sort().map(function(name) {
-          return { value: name, label: name }
-        }))
-      }
+  Bounded {
+    id: fontList
+    maxBytes: 1024 * 1024
+    timeoutMs: 15000
+    Component.onCompleted: start(["/usr/bin/fc-list", ":", "family"])
+    onFinished: function(ok, text) {
+      if (!ok) return
+      var names = {}
+      text.split("\n").slice(0, 5000).forEach(function(line) {
+        var name = line.split(",")[0].trim()
+        // Same rules bin/titlebars applies to titleFont.
+        if (name && name.length <= 128 && !/[\u0000-\u001f\u007f]/.test(name)) names[name] = true
+      })
+      root.fonts = [{ value: "", label: "Omarchy font" }].concat(Object.keys(names).sort().map(function(name) {
+        return { value: name, label: name }
+      }))
     }
   }
 
-  Process {
-    id: appsProcess
-    command: ["hyprctl", "clients", "-j"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        try {
-          var classes = {}
-          JSON.parse(text).forEach(function(client) {
-            if (client["class"] && client["class"] !== "org.quickshell") classes[client["class"]] = true
-          })
-          root.openApps = Object.keys(classes).sort()
-        } catch (e) {
-          root.openApps = []
-        }
+  Bounded {
+    id: apps
+    maxBytes: 2 * 1024 * 1024
+    timeoutMs: 5000
+    onFinished: function(ok, text) {
+      if (!ok) return
+      try {
+        var classes = {}
+        JSON.parse(text).forEach(function(client) {
+          var name = client && typeof client["class"] === "string" ? client["class"] : ""
+          // Only names that are also valid noBarApps entries.
+          if (/^[A-Za-z0-9._-]{1,128}$/.test(name) && name !== "org.quickshell") classes[name] = true
+        })
+        root.openApps = Object.keys(classes).sort().slice(0, 64)
+      } catch (e) {
+        root.openApps = []
       }
     }
   }
@@ -392,7 +381,7 @@ Item {
       focus: true
       Keys.onEscapePressed: root.requestClose()
 
-      // Live preview: an unfocused and a focused window over the wallpaper.
+      // Live preview: an unfocused and a focused window.
       Rectangle {
         id: previewArea
         width: parent.width
@@ -400,14 +389,14 @@ Item {
         color: Color.background
         clip: true
 
-        Image {
+        // A soft backdrop in the theme's colors, so the windows read like a desktop.
+        Rectangle {
           anchors.fill: parent
-          source: "file://" + root.home + "/.local/state/omarchy/current/background"
-          fillMode: Image.PreserveAspectCrop
-          asynchronous: true
-          cache: false
-          sourceSize.width: 1600
-          opacity: 0.9
+          gradient: Gradient {
+            orientation: Gradient.Horizontal
+            GradientStop { position: 0.0; color: Qt.darker(Color.accent, 2.4) }
+            GradientStop { position: 1.0; color: Qt.darker(Color.accent, 1.3) }
+          }
         }
 
         Preview {
@@ -565,7 +554,7 @@ Item {
 
           // First run: build hyprbars and hook it into Hyprland.
           Rectangle {
-            visible: root.needsSetup || root.settingUp
+            visible: root.needsSetup || root.settingUp || root.unsupported || root.problem !== ""
             width: parent.width
             height: setupColumn.implicitHeight + 24
             color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.1)
@@ -583,19 +572,22 @@ Item {
                 width: parent.width
                 wrapMode: Text.WordWrap
                 textFormat: Text.PlainText
-                text: root.settingUp ? root.setupMessage : "Title bars aren't set up yet. Setup builds the hyprbars plugin for your Hyprland version and adds it to your Hyprland config."
+                text: root.settingUp ? root.setupMessage
+                  : root.problem !== "" ? root.problem
+                  : root.unsupported ? "This Title Bars release doesn't support your Hyprland version yet. Update the plugin with omarchy plugin update marcho78.titlebars; your previous build keeps working until you log out."
+                  : "Title bars aren't set up yet. Setup builds the hyprbars plugin for your Hyprland version and adds it to your Hyprland config."
                 color: Color.foreground
                 font.family: Style.font.family
                 font.pixelSize: Style.font.body
               }
               Button {
-                visible: !root.settingUp
+                visible: root.needsSetup && !root.settingUp
                 bordered: true
                 text: "Set up title bars"
                 onClicked: root.startSetup()
               }
               Caption {
-                visible: !root.settingUp && root.setupMessage !== ""
+                visible: root.needsSetup && !root.settingUp && root.setupMessage !== ""
                 text: root.setupMessage
               }
             }
@@ -759,6 +751,7 @@ Item {
                 palette: root.palette
                 roles: root.swatchRoles
                 pickerOpen: root.pickerRole === modelData.role
+                eyedropper: root.eyedropper
                 onPickerToggled: root.pickerRole = root.pickerRole === modelData.role ? "" : modelData.role
                 onPicked: function(v) { root.setColor(modelData.role, v) }
               }

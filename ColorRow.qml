@@ -13,6 +13,7 @@ Item {
   property var palette: ({})
   property var roles: []
   property bool pickerOpen: false
+  property bool eyedropper: false
 
   signal picked(string value)
   signal pickerToggled()
@@ -141,6 +142,7 @@ Item {
         ColorPicker {
           id: picker
           value: root.current
+          canEyedrop: root.eyedropper
           onPicked: function(hex) { root.picked(hex) }
         }
 

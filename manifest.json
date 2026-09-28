@@ -8,9 +8,11 @@
   "homepage": "https://github.com/marcho78/omarchy-titlebars",
   "description": "Window title bars with minimize, maximize, and close buttons that follow your Omarchy theme. A settings panel with live preview lets you restyle the buttons, move them left or right, change or hide the title, pick custom colors, and reset to the default look. Built on hyprbars from hyprwm/hyprland-plugins.",
   "kinds": [
-    "panel"
+    "panel",
+    "service"
   ],
   "entryPoints": {
-    "panel": "Panel.qml"
+    "panel": "Panel.qml",
+    "service": "Service.qml"
   }
 }

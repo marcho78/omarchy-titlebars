@@ -154,26 +154,35 @@ test("title, double click, shortcuts, and enabled switches", function()
 end)
 
 test("apps without title bars", function()
-  local seen = run('{ "noBarApps": ["^chromium$", "", 5, "org.gnome.Nautilus"] }')
-  local apps = {}
-  for _, rule in ipairs(seen.rules) do
-    if rule.rules["hyprbars:no_bar"] and type(rule.match) == "string" then
-      apps[#apps + 1] = rule.match
+  local function no_bar_apps(seen)
+    local apps = {}
+    for _, rule in ipairs(seen.rules) do
+      if rule.rules["hyprbars:no_bar"] and type(rule.match) == "string" then
+        apps[#apps + 1] = rule.match
+      end
     end
+    return table.concat(apps, ",")
   end
-  eq(table.concat(apps, ","), "^WebcamOverlay-(small|medium|large)$,^chromium$,org.gnome.Nautilus", "no_bar rules")
+
+  local seen = run('{ "noBarApps": ["^chromium$", "org.gnome.Nautilus"] }')
+  eq(no_bar_apps(seen), "^WebcamOverlay-(small|medium|large)$,^chromium$,org.gnome.Nautilus", "no_bar rules")
+
+  -- A list with anything invalid in it is ignored as a whole and reported.
+  seen = run('{ "noBarApps": ["^chromium$", "", 5] }')
+  eq(no_bar_apps(seen), "^WebcamOverlay-(small|medium|large)$", "invalid list ignored")
+  assert(seen.notifications[1].text:find("noBarApps", 1, true), "reported")
 end)
 
 test("bad values fall back and are reported", function()
   local seen = run('{ "style": "fancy", "barHeight": 200, "buttonSize": "big", "colors": { "close": "nope" }, "followTheme": false }')
-  eq(seen.bars.bar_height, 48, "clamped height")
+  eq(seen.bars.bar_height, 26, "out-of-range height uses the default")
   eq(seen.buttons[1].size, 12, "default size")
   eq(icons(seen), "× + −", "default style")
   eq(seen.buttons[1].bg_color, "rgb(f7768e)", "fallback color")
   eq(#seen.notifications, 1, "one notification")
   local text = seen.notifications[1].text
-  assert(text:find('style can\'t be "fancy"', 1, true), text)
-  assert(text:find("buttonSize should be a number", 1, true), text)
+  assert(text:find("ignored invalid", 1, true) and text:find("style", 1, true), text)
+  assert(text:find("barHeight", 1, true) and text:find("buttonSize", 1, true), text)
   assert(text:find('unknown color "nope"', 1, true), text)
 end)
 

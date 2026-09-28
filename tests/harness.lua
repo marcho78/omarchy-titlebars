@@ -34,6 +34,12 @@ blue = "#7aa2f7"
 ]]
 write(harness.colors_path, harness.colors)
 
+-- The module reads its state through bin/titlebars; point that at our HOME.
+local real_popen = io.popen
+io.popen = function(command, mode)
+  return real_popen("/usr/bin/env HOME='" .. home .. "' " .. command, mode)
+end
+
 package.loaded["default.hypr.paths"] = {
   home = home,
   config_home = home .. "/.config",

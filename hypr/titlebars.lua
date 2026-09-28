@@ -12,24 +12,11 @@
 local plugin_dir = ...
 local paths = require("default.hypr.paths")
 
-local settings_path = paths.config_home .. "/omarchy/titlebars.json"
-local colors_path = paths.state_home .. "/omarchy/current/theme/colors.toml"
 local hyprbars_path = paths.home .. "/.local/share/hyprbars/hyprbars.so"
-local features_path = paths.home .. "/.local/share/hyprbars/features"
+local max_state_bytes = 256 * 1024
 local minimized_workspace = "special:minimized"
 
 -- Settings -------------------------------------------------------------------
-
-local function read_file(path)
-  local file = io.open(path, "r")
-  if not file then
-    return nil
-  end
-
-  local text = file:read("a")
-  file:close()
-  return text
-end
 
 -- A small JSON reader for the settings files. It reports problems as a second
 -- return value instead of raising, so a bad file never breaks Hyprland's config.
@@ -198,64 +185,45 @@ end
 
 local problems = {}
 
--- defaults.json holds the default look; schema.json the allowed choices and ranges.
-local defaults, defaults_error = decode_json(read_file(plugin_dir .. "/defaults.json") or "")
-local schema, schema_error = decode_json(read_file(plugin_dir .. "/schema.json") or "")
-if type(defaults) ~= "table" or type(schema) ~= "table" then
-  local problem = type(defaults) ~= "table" and "defaults.json (" .. tostring(defaults_error) or "schema.json (" .. tostring(schema_error)
-  hl.notification.create({ text = "Title Bars: can't read " .. problem .. ")", duration = 10000, icon = "error" })
+-- Everything under $HOME is read by bin/titlebars, which opens files without
+-- following symlinks, refuses FIFOs and oversized files, and validates the
+-- settings. Plain Lua can't do that, and a hung read here would stall the
+-- compositor, so the call has a hard deadline and a byte cap.
+local function load_state()
+  local command = "/usr/bin/timeout -k 1 3 /usr/bin/python3 -I "
+    .. o.shell_quote(plugin_dir .. "/bin/titlebars")
+    .. " hypr 2>/dev/null"
+  local handle = io.popen(command, "r")
+  if not handle then
+    return nil, "couldn't run bin/titlebars"
+  end
+  local output = handle:read(max_state_bytes + 1) or ""
+  handle:close()
+  if #output > max_state_bytes then
+    return nil, "bin/titlebars printed too much"
+  end
+  return decode_json(output)
+end
+
+local state, state_error = load_state()
+if type(state) ~= "table" or type(state.defaults) ~= "table" or type(state.settings) ~= "table" then
+  hl.notification.create({ text = "Title Bars: can't load settings (" .. tostring(state_error) .. ")", duration = 10000, icon = "error" })
   return
 end
 
-local user = {}
-local user_text = read_file(settings_path)
-if user_text and user_text:find("%S") then
-  local decoded, decode_error = decode_json(user_text)
-  if type(decoded) == "table" then
-    user = decoded
-  else
-    problems[#problems + 1] = "titlebars.json is not valid JSON (" .. tostring(decode_error) .. "), using the defaults"
-  end
+local defaults = state.defaults
+for _, problem in ipairs(type(state.problems) == "table" and state.problems or {}) do
+  problems[#problems + 1] = tostring(problem)
 end
 
-local choices = {}
-for key, list in pairs(schema.choices or {}) do
-  choices[key] = {}
-  for _, choice in ipairs(list) do
-    choices[key][choice] = true
-  end
-end
-local ranges = schema.ranges or {}
-
+-- bin/titlebars already validated these; keep Lua honest about their types.
 local settings = {}
 for key, default in pairs(defaults) do
-  local value = user[key]
-
-  if value == nil then
-    settings[key] = default
-  elseif type(value) ~= type(default) then
-    problems[#problems + 1] = key .. " should be a " .. type(default)
-    settings[key] = default
-  elseif key == "colors" then
-    settings.colors = {}
-    for role, default_color in pairs(default) do
-      settings.colors[role] = type(value[role]) == "string" and value[role] or default_color
-    end
-  elseif key == "noBarApps" then
-    settings.noBarApps = {}
-    for _, app in ipairs(value) do
-      if type(app) == "string" and app ~= "" then
-        settings.noBarApps[#settings.noBarApps + 1] = app
-      end
-    end
-  elseif choices[key] and not choices[key][value] then
-    problems[#problems + 1] = key .. ' can\'t be "' .. tostring(value) .. '"'
-    settings[key] = default
-  elseif ranges[key] then
-    local low, high = ranges[key][1], ranges[key][2]
-    settings[key] = math.floor(math.max(low, math.min(high, value)) + 0.5)
-  else
+  local value = state.settings[key]
+  if type(value) == type(default) then
     settings[key] = value
+  else
+    settings[key] = default
   end
 end
 
@@ -273,9 +241,8 @@ local palette = {
   green = "9ece6a",
 }
 
-for line in (read_file(colors_path) or ""):gmatch("[^\n]+") do
-  local key, hex = line:match('^%s*([%w_]+)%s*=%s*"#(%x%x%x%x%x%x)"')
-  if key then
+for key, hex in pairs(type(state.palette) == "table" and state.palette or {}) do
+  if type(key) == "string" and type(hex) == "string" and hex:match("^%x%x%x%x%x%x$") then
     palette[key] = hex:lower()
   end
 end
@@ -363,7 +330,7 @@ if not hyprbars then
 end
 
 local function dispatch(expression)
-  return "hyprctl dispatch " .. o.shell_quote(expression)
+  return "/usr/bin/hyprctl dispatch " .. o.shell_quote(expression)
 end
 
 local actions = {
@@ -441,14 +408,13 @@ end
 
 -- A settings gear on the far side of the bar. Needs our hyprbars patch, which
 -- `titlebars build` records in the features file when it applies.
-local features = read_file(features_path) or ""
-if settings.settingsButton and features:find("opposite", 1, true) then
+if settings.settingsButton and state.gear == true then
   hyprbars.add_button({
     bg_color = transparent,
     fg_color = colors.titleInactive,
     size = math.floor(settings.buttonSize * 1.5 + 0.5),
     icon = "󰒓",
-    action = "omarchy-shell shell summon marcho78.titlebars '{}'",
+    action = "/usr/bin/omarchy-shell shell summon marcho78.titlebars '{}'",
     opposite = true,
     icon_always = true,
   })

@@ -2,11 +2,12 @@
 
 Window title bars with minimize, maximize, and close buttons that match your Omarchy theme.
 
-![Title Bars settings](screenshot.png)
+![Title Bars](screenshots/banner.jpg)
 
 Title Bars draws the bars with [hyprbars](https://github.com/hyprwm/hyprland-plugins/tree/main/hyprbars)
-from the official Hyprland plugins repo, builds it for your exact Hyprland
-version, and styles it from your current Omarchy theme. A settings panel with a
+from the official Hyprland plugins repo, which ships inside this plugin and is
+built on your machine for your exact Hyprland version. The bars are styled from
+your current Omarchy theme. A settings panel with a
 live preview changes everything without touching config files.
 
 * Five button styles: traffic lights, labeled, mono, symbols, and Nerd Font icons.
@@ -20,20 +21,47 @@ live preview changes everything without touching config files.
   and they're still in **Style › Title Bars**.
 * Reset to the default look any time.
 
-## Install
+## Screenshots
 
-Title Bars compiles hyprbars, so it needs the Hyprland headers (part of the
-`hyprland` package) and a compiler (`base-devel`), both standard on Omarchy.
+**Buttons:** five styles, left or right, standard or macOS order.
+
+![Buttons page](screenshots/1-buttons.png)
+
+**Title:** show or hide it, alignment, font, size, weight.
+
+![Title page](screenshots/2-title.png)
+
+**Colors:** follow the theme, or pick from theme swatches, a color picker, or anywhere on screen.
+
+![Colors page](screenshots/3-colors.png)
+
+**Bar:** height, edge spacing, border, and double-click action.
+
+![Bar page](screenshots/4-bar.png)
+
+**Behavior:** minimize shortcuts, the settings gear, and apps without title bars.
+
+![Behavior page](screenshots/5-behavior.png)
+
+## Install
 
 ```bash
 omarchy plugin add https://github.com/marcho78/omarchy-titlebars.git --enable
-~/.config/omarchy/plugins/marcho78.titlebars/bin/titlebars setup
 ```
 
-Setup builds hyprbars for your Hyprland version (a minute or two), adds
-`require("hypr.titlebars")` to `~/.config/hypr/hyprland.lua`, adds
-**Style › Title Bars** to the Omarchy menu, and links the `titlebars` command
-into `~/.local/bin`. It is safe to run again.
+The Title Bars panel opens once after install. Click **Set up title bars**:
+it compiles hyprbars for your Hyprland version (a minute or two, nothing is
+downloaded), adds `require("hypr.titlebars")` to `~/.config/hypr/hyprland.lua`,
+adds **Style › Title Bars** to the Omarchy menu, and links the `titlebars`
+command into `~/.local/bin`.
+
+Building needs a C++ compiler and pkg-config (`base-devel`) and the Hyprland
+headers (part of the `hyprland` package), all standard on Omarchy. Setup can
+also run from a terminal, and is safe to repeat:
+
+```bash
+~/.config/omarchy/plugins/marcho78.titlebars/bin/titlebars setup
+```
 
 ## Customize
 
@@ -86,11 +114,15 @@ press Super+Alt+M for the last one you minimized.
 
 ## Hyprland updates
 
-Hyprland plugins must match the running Hyprland exactly. Setup installs a
-post-update hook, so `omarchy update` rebuilds hyprbars whenever Hyprland
-changes, and the new build loads at your next login. If a brand-new Hyprland
-release isn't supported upstream yet, the build fails and keeps the previous
-plugin; Hyprland shows a notice and `titlebars build --force` tries again later.
+Hyprland plugins must match the running Hyprland exactly. Each Title Bars
+release lists the Hyprland releases its bundled hyprbars supports
+(`hypr/pins.json`). Setup installs a post-update hook, so `omarchy update`
+rebuilds hyprbars when Hyprland changes, and the new build loads at your next
+login.
+
+When Hyprland moves to a release this version of Title Bars doesn't list yet,
+nothing is built. The previous build keeps working until you log out, and the
+panel asks you to update the plugin (`omarchy plugin update marcho78.titlebars`).
 
 ## Uninstall
 
@@ -100,9 +132,64 @@ titlebars uninstall --purge    # also delete your settings and the hyprbars buil
 omarchy plugin remove marcho78.titlebars
 ```
 
+## Security
+
+Title Bars runs as unsandboxed code in the Omarchy shell and adds a compiled
+plugin to Hyprland, so here is exactly what it does.
+
+**No network.** Nothing is ever downloaded. hyprbars ships in
+`third_party/hyprbars/` (upstream commit and SHA-256 of every file in
+`UPSTREAM.md`, BSD 3-Clause license alongside). Building copies those files
+into a fresh private directory and compiles them with `/usr/bin/g++` directly,
+using flags from `/usr/bin/pkg-config`: no make, no shell, no downloaded
+toolchain. Only Hyprland releases listed in `hypr/pins.json` are built.
+
+**Programs.** Everything runs by absolute path with an argument list, never
+through a shell: `/usr/bin/g++`, `/usr/bin/pkg-config`, `/usr/bin/hyprctl`,
+`/usr/bin/omarchy`, `/usr/bin/omarchy-shell`, `/usr/bin/fc-list`,
+`/usr/bin/hyprpicker`, `/usr/bin/setsid`, `/usr/bin/kill`, `/usr/bin/timeout`,
+and `/usr/bin/python3 -I` for `bin/titlebars`. Each gets a fixed minimal
+environment (`PATH=/usr/bin`), runs in its own process group, and has a byte
+budget on its output and a deadline, checked while it runs; going over either
+kills the whole group. Nothing asks for root. The title bar buttons are fixed
+`/usr/bin/hyprctl dispatch` commands that Hyprland runs; no setting reaches them.
+
+**Files.** Everything under your home is read and written by `bin/titlebars`,
+through directories opened one component at a time without following
+symlinks. Each directory must be owned by you and not writable by others;
+each file must be a regular file you own, with a single link, under a size cap.
+Writes go to a random temp file in the same directory and are renamed into
+place. The panel reads and writes nothing itself: it asks `bin/titlebars`,
+whose output it reads in capped chunks. Hyprland does the same: its Lua module
+gets validated settings from `bin/titlebars hypr` under a three-second limit and
+a byte cap, so no file can stall the compositor. Title Bars writes only:
+
+| Path | What |
+|---|---|
+| `~/.config/omarchy/titlebars.json` | your settings, only what differs from the defaults |
+| `~/.local/share/hyprbars/` | the built `hyprbars.so` and a record of what it was built from |
+| `~/.local/state/titlebars/setup-offered` | marks that the panel has offered setup once |
+| `~/.config/hypr/titlebars.lua` | a loader for `hypr/titlebars.lua` |
+| `~/.config/hypr/hyprland.lua` | one `require("hypr.titlebars")` line (with a timestamped backup) |
+| `~/.config/omarchy/hooks/post-update.d/titlebars.hook` | the rebuild hook |
+| `~/.config/omarchy/extensions/omarchy-menu.jsonc` | the Style › Title Bars entry |
+| `~/.local/bin/titlebars` | a link to `bin/titlebars`, never replacing a file that isn't ours |
+
+**Input and text.** Settings are validated against `schema.json` (types,
+choices, ranges, string lengths and characters) by `bin/titlebars` before they
+are stored or used. Every text element in the panel is `Text.PlainText`, and
+window classes and font names shown in it are filtered to plain characters.
+
+**Limits.** Anything running as your user can replace
+`~/.local/share/hyprbars/hyprbars.so` or edit your Hyprland config directly;
+Title Bars doesn't try to defend against that.
+
 ## Development
 
 `lua tests/hypr.test.lua` runs the Hyprland module against a fake Hyprland API.
+`python3 tests/cli.test.py` checks `bin/titlebars`: validation, refusal of
+symlinked, oversized, or shared files, setup and uninstall edits, pinning, and
+process limits.
 `node tests/styles.test.cjs` checks that the panel preview draws exactly what
 Hyprland will.
 
@@ -112,10 +199,7 @@ changing QML.
 
 ## Credits
 
-hyprbars is by Vaxry and the Hyprland contributors, BSD 3-Clause. Title Bars
-clones and builds it on your machine; it doesn't ship its code.
-
-hyprbars puts every button on one side, so Title Bars applies a small patch
-(`hypr/hyprbars-opposite.patch`) at build time to place the gear on the other
-side. If a future hyprbars no longer takes the patch, the build goes ahead
-without it and the gear stays hidden.
+hyprbars is by Vaxry and the Hyprland contributors, BSD 3-Clause
+(`third_party/hyprbars/LICENSE`). Title Bars ships it with one change,
+`third_party/hyprbars/opposite-side-buttons.patch`, which lets the settings gear
+sit on the other side of the bar.

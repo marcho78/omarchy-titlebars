@@ -34,7 +34,7 @@ function parsePalette(text) {
   return palette
 }
 
-// Defaults with the user's overrides on top, validated the way the Lua does.
+// Defaults with the user's overrides on top, validated like bin/titlebars.
 function merge(defaults, user, schema) {
   var settings = clone(defaults)
   var choices = (schema && schema.choices) || {}
@@ -51,13 +51,16 @@ function merge(defaults, user, schema) {
         if (typeof value[role] === "string") settings.colors[role] = value[role]
       })
     } else if (key === "noBarApps") {
-      if (Array.isArray(value)) settings.noBarApps = value.filter(function(app) { return typeof app === "string" && app !== "" })
+      // A list with anything invalid in it is ignored as a whole, like bin/titlebars.
+      if (Array.isArray(value) && value.every(function(app) { return typeof app === "string" && app !== "" }))
+        settings.noBarApps = value
     } else if (typeof value !== typeof fallback) {
       return
     } else if (choices[key] && choices[key].indexOf(value) < 0) {
       return
     } else if (ranges[key]) {
-      settings[key] = Math.round(Math.max(ranges[key][0], Math.min(ranges[key][1], value)))
+      // Out-of-range numbers keep the default, like bin/titlebars.
+      if (Number.isInteger(value) && value >= ranges[key][0] && value <= ranges[key][1]) settings[key] = value
     } else {
       settings[key] = value
     }

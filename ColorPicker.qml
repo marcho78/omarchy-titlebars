@@ -1,5 +1,4 @@
 import QtQuick
-import Quickshell.Io
 import qs.Commons
 import qs.Ui
 
@@ -129,7 +128,7 @@ Column {
         text: eyedropper.running ? "Click…" : "Pick"
         tooltipText: "Pick a color from anywhere on screen"
         fontSize: Style.font.bodySmall
-        onClicked: if (!eyedropper.running) eyedropper.running = true
+        onClicked: eyedropper.start(["/usr/bin/hyprpicker", "--format=hex", "--lowercase-hex", "--no-fancy"])
       }
     }
   }
@@ -179,22 +178,15 @@ Column {
 
   // Samples a pixel anywhere on screen; Esc cancels without output. No
   // --quiet: in hyprpicker it silences the picked color too.
-  Process {
+  Bounded {
     id: eyedropper
-    command: ["hyprpicker", "--format=hex", "--lowercase-hex", "--no-fancy"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        // The picked color is the last thing printed, after any log lines.
-        var matches = text.match(/#[0-9a-f]{6}/g)
-        if (matches) root.picked(matches[matches.length - 1])
-      }
+    maxBytes: 4096
+    timeoutMs: 120000
+    onFinished: function(ok, text) {
+      if (!ok) return
+      // The picked color is the last thing printed, after any log lines.
+      var matches = text.match(/#[0-9a-f]{6}/g)
+      if (matches) root.picked(matches[matches.length - 1])
     }
-  }
-
-  Process {
-    running: true
-    command: ["sh", "-c", "command -v hyprpicker"]
-    onExited: function(exitCode) { root.canEyedrop = exitCode === 0 }
   }
 }

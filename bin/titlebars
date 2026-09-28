@@ -1,235 +1,798 @@
-#!/bin/bash
+#!/usr/bin/python3 -I
+"""titlebars: set up, build, and configure the Title Bars Omarchy plugin.
 
-# Title Bars: window title bars with minimize / maximize / close buttons for
-# Omarchy, drawn by hyprbars (https://github.com/hyprwm/hyprland-plugins).
+  titlebars settings [page]    open the settings panel
+  titlebars get [key]          show settings (defaults plus your changes)
+  titlebars set <key> <value>  change one setting
+  titlebars reset              back to the default look
+  titlebars status             what is built, hooked up, and loaded
+  titlebars setup              build hyprbars and hook Title Bars into Hyprland
+  titlebars build [--force]    rebuild hyprbars for the installed Hyprland
+  titlebars uninstall [--purge]
 
-set -euo pipefail
+The panel also uses two machine-facing commands: `load` prints everything it
+needs as one line of JSON, and `save <json>` validates and stores its changes.
 
-PLUGIN_ID="marcho78.titlebars"
-PLUGIN_DIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
-DEFAULTS="$PLUGIN_DIR/defaults.json"
-SCHEMA="$PLUGIN_DIR/schema.json"
-SETTINGS="$HOME/.config/omarchy/titlebars.json"
-THEME_COLORS="$HOME/.local/state/omarchy/current/theme/colors.toml"
+Safety model
+------------
+* Every file under $HOME is reached through directory descriptors opened
+  O_NOFOLLOW one component at a time from $HOME down; each directory must be
+  owned by this uid and not group- or world-writable. Files are opened
+  O_NOFOLLOW relative to those descriptors, must be regular, owned by this uid,
+  single-link, and under a per-file byte cap; exactly that many bytes are read.
+  Writes go to a random O_EXCL temp file in the same verified directory, are
+  fsynced, then renamed into place.
+* Settings are validated against defaults.json and schema.json (types,
+  choices, ranges, string lengths and character sets) in both directions.
+* External programs run by absolute path with an argv list, a minimal fixed
+  environment, their own process group, a byte budget on output, and a
+  deadline; on overflow or timeout the whole group is killed.
+* Nothing is downloaded. hyprbars is compiled from the sources vendored in
+  third_party/hyprbars (see UPSTREAM.md), copied into a fresh private build
+  directory and built with /usr/bin/g++ directly (no make, no shell), only for
+  Hyprland releases listed in hypr/pins.json; others are refused and the
+  previous build is kept.
+"""
 
-BUILD_DIR="$HOME/.local/share/hyprbars"
-BUILD_SRC="$BUILD_DIR/hyprland-plugins"
-BUILD_PLUGIN="$BUILD_DIR/hyprbars.so"
-BUILD_STAMP="$BUILD_DIR/built-for-hyprland"
-HYPRBARS_REPO="https://github.com/hyprwm/hyprland-plugins"
-HYPRLAND_VERSION_H="/usr/include/hyprland/src/version.h"
+import hashlib
+import json
+import os
+import re
+import secrets
+import shlex
+import select
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import time
 
-HYPR_CONFIG="$HOME/.config/hypr/hyprland.lua"
-HYPR_STUB="$HOME/.config/hypr/titlebars.lua"
-REQUIRE_LINE='require("hypr.titlebars")'
-HOOK="$HOME/.config/omarchy/hooks/post-update.d/titlebars.hook"
-MENU="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
-MENU_ENTRY="  \"style.titlebars\": {\"icon\":\"󰖯\",\"label\":\"Title Bars\",\"action\":\"omarchy-shell shell summon $PLUGIN_ID '{}'\"},"
-CLI_LINK="$HOME/.local/bin/titlebars"
+PLUGIN_ID = "marcho78.titlebars"
+PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+HOME = os.environ.get("HOME", "")
+UID = os.getuid()
 
-usage() {
-  cat <<EOF
-Usage: titlebars <command>
+CXX = "/usr/bin/g++"
+PKG_CONFIG = "/usr/bin/pkg-config"
+HYPRCTL = "/usr/bin/hyprctl"
+HYPRPICKER = "/usr/bin/hyprpicker"
+OMARCHY = "/usr/bin/omarchy"
+OMARCHY_SHELL = "/usr/bin/omarchy-shell"
+PYTHON = "/usr/bin/python3"
+VERSION_H = "/usr/include/hyprland/src/version.h"
 
-  settings [page]       Open the settings panel (buttons, title, colors, bar, behavior)
-  set <key> <value>     Change a setting, e.g. \`titlebars set buttons left\`
-  get [key]             Show all settings, or one
-  reset                 Go back to the default look
-  status                Show what is installed and loaded
+SETTINGS_DIR = (".config", "omarchy")
+SETTINGS_FILE = "titlebars.json"
+THEME_DIR = (".local", "state", "omarchy", "current", "theme")
+BUILD_DIR = (".local", "share", "hyprbars")
+HYPR_DIR = (".config", "hypr")
+HOOK_DIR = (".config", "omarchy", "hooks", "post-update.d")
+MENU_DIR = (".config", "omarchy", "extensions")
+BIN_DIR = (".local", "bin")
 
-  setup                 Build hyprbars and hook Title Bars into Hyprland (safe to re-run)
-  build [--force]       Rebuild hyprbars for the installed Hyprland
-  uninstall [--purge]   Unhook Title Bars from Hyprland (--purge also deletes settings and the build)
+HYPR_CONFIG = "hyprland.lua"
+HYPR_STUB = "titlebars.lua"
+REQUIRE_LINE = 'require("hypr.titlebars")'
+HOOK_FILE = "titlebars.hook"
+MENU_FILE = "omarchy-menu.jsonc"
+MENU_KEY = '"style.titlebars"'
+MENU_ENTRY = (
+    '  "style.titlebars": {"icon":"\U000F05AF","label":"Title Bars",'
+    f'"action":"{OMARCHY_SHELL} shell summon {PLUGIN_ID} \'{{}}\'"}},'
+)
+PAGES = ("buttons", "title", "colors", "bar", "behavior")
 
-Settings live in $SETTINGS; keys and defaults are in $DEFAULTS.
-Colors are theme roles from colors.toml (red, accent, background, ...) or #rrggbb / #rrggbbaa.
-EOF
-}
+KiB = 1024
+MiB = 1024 * KiB
+MAX_SETTINGS = 64 * KiB
+MAX_PLUGIN_FILE = 256 * KiB
+MAX_CONFIG_FILE = 1 * MiB
+MAX_PLUGIN_SO = 64 * MiB
+MAX_APPS = 32
+MAX_APP_LEN = 128
+MAX_FONT_LEN = 128
 
-reload_hyprland() {
-  if [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]]; then
-    hyprctl reload >/dev/null
-  fi
-}
+COLOR_RE = re.compile(r"^(#[0-9a-fA-F]{6}([0-9a-fA-F]{2})?|[a-z_]{1,32})$")
+APP_RE = re.compile(r"^[A-Za-z0-9 ._\-^$|()*+?\[\]\\:/]{1,%d}$" % MAX_APP_LEN)
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
-# Settings --------------------------------------------------------------------
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
-current_settings() {
-  if [[ -s $SETTINGS ]]; then
-    jq -s '.[0] * .[1]' "$DEFAULTS" "$SETTINGS"
-  else
-    jq . "$DEFAULTS"
-  fi
-}
 
-# Keep only the values that differ from the defaults, so defaults can improve.
-write_settings() {
-  local merged="$1" tmp
-  mkdir -p "$(dirname "$SETTINGS")"
-  tmp=$(mktemp "$SETTINGS.XXXXXX")
-  jq --slurpfile defaults "$DEFAULTS" '
-    $defaults[0] as $d
-    | with_entries(select(.key as $k | $d | has($k)))
-    | with_entries(select(.value != $d[.key]))
-    | if .colors then .colors |= with_entries(select(.value != $d.colors[.key])) else . end
-    | if .colors == {} then del(.colors) else . end
-  ' <<<"$merged" >"$tmp"
-  mv -f "$tmp" "$SETTINGS"
-}
+class Refused(Exception):
+    pass
 
-cmd_get() {
-  if (($# == 0)); then
-    current_settings
-  elif ! current_settings | jq -r --arg key "$1" '
-    (try getpath($key | split(".")) catch null) as $value
-    | if $value == null then halt_error(1) else $value end' 2>/dev/null; then
-    echo "titlebars: unknown setting '$1'" >&2
-    exit 1
-  fi
-}
 
-cmd_set() {
-  (($# == 2)) || { echo "Usage: titlebars set <key> <value>" >&2; exit 1; }
-  local key="$1" raw="$2" kind value
+def say(message):
+    sys.stdout.write(message + "\n")
+    sys.stdout.flush()
 
-  kind=$(jq -r --arg key "$key" 'getpath($key | split(".")) | type' "$DEFAULTS")
-  case $kind in
-  boolean)
-    case ${raw,,} in
-    true | on | yes | 1) value=true ;;
-    false | off | no | 0) value=false ;;
-    *) echo "titlebars: $key takes on or off" >&2; exit 1 ;;
-    esac
-    ;;
-  number)
-    local range
-    range=$(jq -r --arg key "$key" '.ranges[$key] // [0, 999] | join(" ")' "$SCHEMA")
-    if [[ ! $raw =~ ^[0-9]+$ ]] || ((raw < ${range% *} || raw > ${range#* })); then
-      echo "titlebars: $key takes a whole number from ${range% *} to ${range#* }" >&2
-      exit 1
-    fi
-    value=$raw
-    ;;
-  string)
-    local allowed
-    allowed=$(jq -r --arg key "$key" '.choices[$key] // empty | join(" ")' "$SCHEMA")
-    if [[ -n $allowed && " $allowed " != *" $raw "* ]]; then
-      echo "titlebars: $key takes one of: $allowed" >&2
-      exit 1
-    fi
-    if [[ $key == colors.* && ! $raw =~ ^#([0-9a-fA-F]{6}|[0-9a-fA-F]{8})$ ]] &&
-      ! { [[ $raw =~ ^[a-z_]+$ ]] && grep -qE "^[[:space:]]*$raw[[:space:]]*=" "$THEME_COLORS" 2>/dev/null; }; then
-      echo "titlebars: $key takes #rrggbb, #rrggbbaa, or a theme color name from colors.toml" >&2
-      exit 1
-    fi
-    value=$(jq -n --arg v "$raw" '$v')
-    ;;
-  array) value=$(jq -n --arg v "$raw" '$v | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(. != ""))') ;;
-  *) echo "titlebars: unknown setting '$key' (see \`titlebars get\`)" >&2; exit 1 ;;
-  esac
 
-  write_settings "$(current_settings | jq --arg key "$key" --argjson value "$value" 'setpath($key | split("."); $value)')"
-  reload_hyprland
-}
+# Verified directories and files -------------------------------------------------
 
-cmd_reset() {
-  rm -f "$SETTINGS"
-  reload_hyprland
-  echo "Title bars are back to the default look."
-}
 
-cmd_settings() {
-  omarchy-shell shell summon "$PLUGIN_ID" "$(jq -cn --arg page "${1:-}" 'if $page == "" then {} else {page: $page} end')" >/dev/null
-}
+def verify_dir(fd, what):
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode):
+        raise Refused(f"{what} is not a directory")
+    if st.st_uid != UID:
+        raise Refused(f"{what} is not owned by you")
+    if st.st_mode & 0o022:
+        raise Refused(f"{what} is writable by others")
 
-# Build -----------------------------------------------------------------------
 
-cmd_build() {
-  if [[ ! -f $HYPRLAND_VERSION_H ]]; then
-    echo "titlebars: Hyprland headers are missing ($HYPRLAND_VERSION_H)" >&2
-    exit 1
-  fi
-  for tool in git make g++ pkg-config; do
-    command -v "$tool" >/dev/null || { echo "titlebars: $tool is needed to build hyprbars (omarchy pkg add base-devel)" >&2; exit 1; }
-  done
+def open_home():
+    parts = HOME.split("/")[1:]
+    if not HOME.startswith("/") or HOME == "/" or any(p in ("", ".", "..") for p in parts):
+        raise Refused("HOME is not a usable absolute path")
+    fd = os.open("/", DIR_FLAGS)
+    for name in parts:
+        try:
+            nxt = os.open(name, DIR_FLAGS, dir_fd=fd)
+        finally:
+            os.close(fd)
+        fd = nxt
+    try:
+        verify_dir(fd, HOME)
+    except Refused:
+        os.close(fd)
+        raise
+    return fd
 
-  local hyprland_commit hyprland_version pinned
-  hyprland_commit=$(sed -n 's/^#define GIT_COMMIT_HASH *"\([0-9a-f]*\)".*/\1/p' "$HYPRLAND_VERSION_H")
-  hyprland_version=$(pkg-config --modversion hyprland)
 
-  if [[ ${1:-} != "--force" && -f $BUILD_PLUGIN && -f $BUILD_DIR/features && $(cat "$BUILD_STAMP" 2>/dev/null) == "$hyprland_commit" ]]; then
-    echo "hyprbars is already built for Hyprland $hyprland_version"
-    return
-  fi
+def open_dir(rel, create=False):
+    """Descriptor for $HOME/<rel...>, or None when missing and not created."""
+    fd = open_home()
+    path = HOME
+    try:
+        for name in rel:
+            path += "/" + name
+            try:
+                nxt = os.open(name, DIR_FLAGS, dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    os.close(fd)
+                    return None
+                try:
+                    os.mkdir(name, 0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                nxt = os.open(name, DIR_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+            verify_dir(fd, path)
+    except (OSError, Refused) as error:
+        os.close(fd)
+        if isinstance(error, Refused):
+            raise
+        raise Refused(f"cannot open {path}: {error.strerror}")
+    return fd
 
-  mkdir -p "$BUILD_DIR"
-  if [[ -d $BUILD_SRC/.git ]]; then
-    git -C "$BUILD_SRC" fetch --quiet origin
-  else
-    git clone --quiet "$HYPRBARS_REPO" "$BUILD_SRC"
-  fi
 
-  # hyprpm.toml pins a plugin commit for each Hyprland release commit. Fall back
-  # to the latest main when a brand-new Hyprland release hasn't been pinned yet.
-  pinned=$(git -C "$BUILD_SRC" show origin/main:hyprpm.toml |
-    sed -n "s/.*\[\"$hyprland_commit\", *\"\([0-9a-f]\{40\}\)\"\].*/\1/p" | head -n1)
-  git -C "$BUILD_SRC" checkout --quiet --force --detach "${pinned:-origin/main}"
+def read_file(dfd, name, limit):
+    """Bytes of a verified regular file, or None when it doesn't exist."""
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=dfd)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise Refused(f"cannot open {name}: {error.strerror}")
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != UID or st.st_nlink != 1:
+            raise Refused(f"{name} is not a regular file owned by you with a single link")
+        if st.st_size > limit:
+            raise Refused(f"{name} is larger than {limit} bytes")
+        data = b""
+        while len(data) < st.st_size:
+            chunk = os.read(fd, st.st_size - len(data))
+            if not chunk:
+                break
+            data += chunk
+        return data
+    finally:
+        os.close(fd)
 
-  # Our patch lets the settings button sit on the other side of the bar. If a
-  # newer hyprbars no longer takes it, build without it and the button hides.
-  local features=""
-  if git -C "$BUILD_SRC" apply --check "$PLUGIN_DIR/hypr/hyprbars-opposite.patch" 2>/dev/null; then
-    git -C "$BUILD_SRC" apply "$PLUGIN_DIR/hypr/hyprbars-opposite.patch"
-    features="opposite"
-  else
-    echo "Note: the settings-button patch doesn't fit this hyprbars version; building without it."
-  fi
 
-  echo "Building hyprbars $(git -C "$BUILD_SRC" rev-parse --short HEAD) for Hyprland $hyprland_version..."
-  # Upstream builds with narrowing warnings; hide them but keep real errors.
-  CXXFLAGS="-O2 -w" make --always-make --silent -C "$BUILD_SRC/hyprbars" all
+def write_file(dfd, name, data, mode=0o600):
+    tmp = f".{name}.{secrets.token_hex(8)}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            out.write(data)
+            out.flush()
+            os.fchmod(out.fileno(), mode)
+            os.fsync(out.fileno())
+        os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+    except BaseException:
+        try:
+            os.unlink(tmp, dir_fd=dfd)
+        except OSError:
+            pass
+        raise
 
-  # Replace via rename so a running Hyprland keeps its mapped copy intact.
-  install -m 644 "$BUILD_SRC/hyprbars/hyprbars.so" "$BUILD_PLUGIN.new"
-  mv -f "$BUILD_PLUGIN.new" "$BUILD_PLUGIN"
-  echo "$features" >"$BUILD_DIR/features"
-  git -C "$BUILD_SRC" checkout --quiet -- .
-  echo "$hyprland_commit" >"$BUILD_STAMP"
-  echo "Installed $BUILD_PLUGIN"
-}
 
-# Setup -----------------------------------------------------------------------
+def remove_file(dfd, name):
+    """Unlink a regular file (never a directory), if present."""
+    try:
+        st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    if not (stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode)) or st.st_uid != UID:
+        raise Refused(f"{name} is not a file owned by you")
+    os.unlink(name, dir_fd=dfd)
+    return True
 
-# Mirrors how the Omarchy menu reads JSONC: drop comment lines and trailing commas.
-menu_is_valid() {
-  sed -E 's#^[[:space:]]*//.*$##' "$1" | perl -0777 -pe 's/,(\s*[}\]])/$1/g' | jq -e 'type == "object"' >/dev/null 2>&1
-}
 
-add_menu_entry() {
-  if [[ ! -f $MENU ]]; then
-    mkdir -p "$(dirname "$MENU")"
-    printf '{\n%s\n}\n' "$MENU_ENTRY" >"$MENU"
-    return
-  fi
-  grep -q '"style.titlebars"' "$MENU" && return
+def read_plugin_json(name):
+    path = os.path.join(PLUGIN_DIR, name)
+    with open(path, "rb") as source:
+        data = source.read(MAX_PLUGIN_FILE + 1)
+    if len(data) > MAX_PLUGIN_FILE:
+        raise Refused(f"{name} is too large")
+    return json.loads(data)
 
-  local tmp
-  tmp=$(mktemp)
-  awk -v entry="$MENU_ENTRY" '!done && /^[[:space:]]*\{/ { print; print entry; done = 1; next } { print }' "$MENU" >"$tmp"
-  if menu_is_valid "$tmp"; then
-    cat "$tmp" >"$MENU"
-  else
-    echo "Couldn't add Title Bars to the Omarchy menu automatically; add this line to $MENU:"
-    echo "$MENU_ENTRY"
-  fi
-  rm -f "$tmp"
-}
 
-cmd_setup() {
-  cmd_build
+# Bounded processes ---------------------------------------------------------------------
 
-  cat >"$HYPR_STUB" <<'EOF'
--- Window title bars from the Title Bars Omarchy plugin (marcho78.titlebars).
+
+def base_env(**extra):
+    env = {"PATH": "/usr/bin", "HOME": HOME, "LANG": "C.UTF-8"}
+    for key in ("XDG_RUNTIME_DIR", "HYPRLAND_INSTANCE_SIGNATURE", "WAYLAND_DISPLAY"):
+        if os.environ.get(key):
+            env[key] = os.environ[key]
+    env.update(extra)
+    return env
+
+
+def run(argv, *, timeout, limit=64 * KiB, env=None, pass_fds=(), cwd=None, keep_tail=False):
+    """Run argv in its own process group with a byte budget and a deadline.
+
+    Returns (exit_code, output). Output past the budget either kills the group
+    (default) or, with keep_tail, keeps only the last `limit` bytes.
+    """
+    proc = subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env or base_env(),
+        pass_fds=pass_fds,
+        cwd=cwd,
+        process_group=0,
+        close_fds=True,
+    )
+    deadline = time.monotonic() + timeout
+    output = bytearray()
+    problem = None
+    try:
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                problem = f"{os.path.basename(argv[0])} took longer than {timeout}s"
+                break
+            ready, _, _ = select.select([proc.stdout], [], [], min(left, 1.0))
+            if not ready:
+                if proc.poll() is not None:
+                    break
+                continue
+            chunk = os.read(proc.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            output += chunk
+            if len(output) > limit:
+                if keep_tail:
+                    del output[: len(output) - limit]
+                else:
+                    problem = f"{os.path.basename(argv[0])} printed more than {limit} bytes"
+                    break
+    finally:
+        if problem:
+            kill_group(proc)
+        proc.stdout.close()
+    try:
+        code = proc.wait(timeout=max(1.0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        kill_group(proc)
+        code = proc.wait()
+        problem = problem or f"{os.path.basename(argv[0])} took longer than {timeout}s"
+    if problem:
+        raise Refused(problem)
+    return code, output.decode("utf-8", "replace")
+
+
+def kill_group(proc):
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            return
+        try:
+            proc.wait(timeout=3)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def reload_hyprland():
+    if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") and os.access(HYPRCTL, os.X_OK):
+        run([HYPRCTL, "reload"], timeout=15, limit=4 * KiB)
+
+
+# Settings ----------------------------------------------------------------------------------
+
+
+def load_spec():
+    return read_plugin_json("defaults.json"), read_plugin_json("schema.json")
+
+
+def clean_value(key, value, defaults, schema):
+    """The value if it is valid for key, else None."""
+    default = defaults[key]
+    if key == "colors":
+        if not isinstance(value, dict):
+            return None
+        colors = {}
+        for role in defaults["colors"]:
+            color = value.get(role)
+            if isinstance(color, str) and COLOR_RE.match(color):
+                colors[role] = color
+        return colors
+    if key == "noBarApps":
+        if not isinstance(value, list) or len(value) > MAX_APPS:
+            return None
+        if not all(isinstance(app, str) and APP_RE.match(app) for app in value):
+            return None
+        return list(value)
+    if isinstance(default, bool):
+        return value if isinstance(value, bool) else None
+    if isinstance(default, int):
+        low, high = schema.get("ranges", {}).get(key, (0, 999))
+        if isinstance(value, float) and value.is_integer():
+            value = int(value)
+        ok = isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
+        return value if ok else None
+    if isinstance(default, str):
+        if not isinstance(value, str):
+            return None
+        choices = schema.get("choices", {}).get(key)
+        if choices is not None:
+            return value if value in choices else None
+        if key == "titleFont":
+            ok = len(value) <= MAX_FONT_LEN and all(ch.isprintable() for ch in value)
+            return value if ok else None
+    return None
+
+
+def only_changes(settings, defaults):
+    """Drop values equal to the defaults so defaults can improve later."""
+    changes = {}
+    for key, value in settings.items():
+        if key == "colors":
+            colors = {role: c for role, c in value.items() if c != defaults["colors"][role]}
+            if colors:
+                changes["colors"] = colors
+        elif value != defaults[key]:
+            changes[key] = value
+    return changes
+
+
+def clean_settings(raw, defaults, schema):
+    """(valid changes, list of rejected keys) from a settings object."""
+    if not isinstance(raw, dict):
+        return {}, ["settings"]
+    valid, rejected = {}, []
+    for key, value in list(raw.items())[:64]:
+        if key not in defaults:
+            continue
+        cleaned = clean_value(key, value, defaults, schema)
+        if cleaned is None:
+            rejected.append(key)
+        else:
+            valid[key] = cleaned
+    return only_changes(valid, defaults), rejected
+
+
+def read_settings(defaults, schema, rejected=None):
+    """Your valid changes; names of invalid ones are appended to `rejected`."""
+    dfd = open_dir(SETTINGS_DIR)
+    if dfd is None:
+        return {}
+    try:
+        data = read_file(dfd, SETTINGS_FILE, MAX_SETTINGS)
+    finally:
+        os.close(dfd)
+    if data is None or not data.strip():
+        return {}
+    try:
+        raw = json.loads(data)
+    except (ValueError, UnicodeDecodeError):
+        raise Refused(f"{SETTINGS_FILE} is not valid JSON; fix it or run `titlebars reset`")
+    changes, bad = clean_settings(raw, defaults, schema)
+    if rejected is not None:
+        rejected.extend(bad)
+    return changes
+
+
+def write_settings(changes):
+    dfd = open_dir(SETTINGS_DIR, create=True)
+    try:
+        if changes:
+            write_file(dfd, SETTINGS_FILE, (json.dumps(changes, indent=2) + "\n").encode())
+        else:
+            remove_file(dfd, SETTINGS_FILE)
+    finally:
+        os.close(dfd)
+
+
+def merged(defaults, changes):
+    settings = json.loads(json.dumps(defaults))
+    for key, value in changes.items():
+        if key == "colors":
+            settings["colors"].update(value)
+        else:
+            settings[key] = value
+    return settings
+
+
+def theme_palette():
+    """colors.toml roles as rrggbb; empty if the theme can't be read safely."""
+    try:
+        dfd = open_dir(THEME_DIR)
+    except Refused:
+        return {}
+    if dfd is None:
+        return {}
+    try:
+        data = read_file(dfd, "colors.toml", 64 * KiB) or b""
+    except Refused:
+        return {}
+    finally:
+        os.close(dfd)
+    palette = {}
+    for line in data.decode("utf-8", "replace").splitlines()[:512]:
+        match = re.match(r'^\s*([a-z_]{1,32})\s*=\s*"#([0-9a-fA-F]{6})"', line)
+        if match:
+            palette[match.group(1)] = match.group(2).lower()
+    return palette
+
+
+def cmd_get(args):
+    defaults, schema = load_spec()
+    settings = merged(defaults, read_settings(defaults, schema))
+    if not args:
+        say(json.dumps(settings, indent=2, ensure_ascii=False))
+        return
+    value = settings
+    for part in args[0].split("."):
+        if not isinstance(value, dict) or part not in value:
+            raise Refused(f"unknown setting '{args[0]}' (see `titlebars get`)")
+        value = value[part]
+    say(value if isinstance(value, str) else json.dumps(value, ensure_ascii=False))
+
+
+def parse_cli_value(key, raw, defaults, schema):
+    path = key.split(".")
+    if len(path) == 2 and path[0] == "colors" and path[1] in defaults["colors"]:
+        if not COLOR_RE.match(raw) or (not raw.startswith("#") and raw not in theme_palette()):
+            raise Refused(f"{key} takes #rrggbb, #rrggbbaa, or a theme color name from colors.toml")
+        return raw
+    if len(path) != 1 or key not in defaults or key == "colors":
+        raise Refused(f"unknown setting '{key}' (see `titlebars get`)")
+    default = defaults[key]
+    if isinstance(default, bool):
+        words = {"true": True, "on": True, "yes": True, "1": True, "false": False, "off": False, "no": False, "0": False}
+        if raw.lower() not in words:
+            raise Refused(f"{key} takes on or off")
+        return words[raw.lower()]
+    if isinstance(default, int):
+        low, high = schema.get("ranges", {}).get(key, (0, 999))
+        if not re.fullmatch(r"[0-9]{1,4}", raw) or not low <= int(raw) <= high:
+            raise Refused(f"{key} takes a whole number from {low} to {high}")
+        return int(raw)
+    if isinstance(default, list):
+        apps = [app.strip() for app in raw.split(",") if app.strip()]
+        if clean_value(key, apps, defaults, schema) is None:
+            raise Refused(f"{key} takes up to {MAX_APPS} window classes (letters, digits, and regex symbols)")
+        return apps
+    choices = schema.get("choices", {}).get(key)
+    if clean_value(key, raw, defaults, schema) is None:
+        raise Refused(f"{key} takes one of: {' '.join(choices)}" if choices else f"{key} can't be that value")
+    return raw
+
+
+def cmd_set(args):
+    if len(args) != 2:
+        raise Refused("usage: titlebars set <key> <value>")
+    defaults, schema = load_spec()
+    changes = read_settings(defaults, schema)
+    value = parse_cli_value(args[0], args[1], defaults, schema)
+    settings = merged(defaults, changes)
+    if args[0].startswith("colors."):
+        settings["colors"][args[0].split(".")[1]] = value
+    else:
+        settings[args[0]] = value
+    write_settings(only_changes(settings, defaults))
+    reload_hyprland()
+
+
+def cmd_reset(_args):
+    write_settings({})
+    reload_hyprland()
+    say("Title bars are back to the default look.")
+
+
+def cmd_save(args):
+    """Store settings sent by the panel: one JSON object of changes."""
+    if len(args) != 1 or len(args[0].encode()) > MAX_SETTINGS:
+        raise Refused("usage: titlebars save <json>")
+    defaults, schema = load_spec()
+    try:
+        raw = json.loads(args[0])
+    except ValueError:
+        raise Refused("settings are not valid JSON")
+    changes, rejected = clean_settings(raw, defaults, schema)
+    if rejected:
+        raise Refused("invalid values for: " + ", ".join(rejected))
+    write_settings(changes)
+    reload_hyprland()
+    say("ok")
+
+
+def cmd_settings(args):
+    payload = {}
+    if args:
+        if args[0] not in PAGES:
+            raise Refused("pages: " + ", ".join(PAGES))
+        payload["page"] = args[0]
+    run([OMARCHY_SHELL, "shell", "summon", PLUGIN_ID, json.dumps(payload)], timeout=10, limit=4 * KiB)
+
+
+# Status ------------------------------------------------------------------------------------------
+
+
+def hyprland_commit():
+    with open(VERSION_H, "rb") as header:
+        text = header.read(64 * KiB).decode("utf-8", "replace")
+    match = re.search(r'^#define GIT_COMMIT_HASH\s+"([0-9a-f]{40})"', text, re.M)
+    if not match:
+        raise Refused(f"can't find the Hyprland commit in {VERSION_H}")
+    return match.group(1)
+
+
+def build_state():
+    """(stamp words, features) recorded by the last build."""
+    dfd = open_dir(BUILD_DIR)
+    if dfd is None:
+        return [], ""
+    try:
+        stamp = (read_file(dfd, "built-for-hyprland", 1 * KiB) or b"").decode("utf-8", "replace").split()
+        features = (read_file(dfd, "features", 1 * KiB) or b"").decode("utf-8", "replace").strip()
+        try:
+            st = os.stat("hyprbars.so", dir_fd=dfd, follow_symlinks=False)
+            has_plugin = stat.S_ISREG(st.st_mode) and st.st_uid == UID
+        except FileNotFoundError:
+            has_plugin = False
+    finally:
+        os.close(dfd)
+    return (stamp if has_plugin else []), features
+
+
+def status():
+    try:
+        commit = hyprland_commit()
+    except (OSError, Refused):
+        commit = ""
+    stamp, features = build_state()
+    version = supported_version(commit) or ""
+    built = bool(stamp) and stamp[0] == commit
+    hooked = False
+    hdir = open_dir(HYPR_DIR)
+    if hdir is not None:
+        try:
+            config = read_file(hdir, HYPR_CONFIG, MAX_CONFIG_FILE) or b""
+            lines = config.decode("utf-8", "replace").splitlines()
+            hooked = any(line.strip() == REQUIRE_LINE for line in lines) and read_file(hdir, HYPR_STUB, 64 * KiB) is not None
+        finally:
+            os.close(hdir)
+    loaded = False
+    if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        try:
+            _, out = run([HYPRCTL, "plugin", "list"], timeout=10, limit=64 * KiB)
+            loaded = any(line.startswith("Plugin hyprbars") for line in out.splitlines())
+        except Refused:
+            pass
+    return {
+        "built": built,
+        "supported": bool(version),
+        "version": version,
+        "hooked": hooked,
+        "loaded": loaded,
+        "gear": built and "opposite" in features.split(),
+    }
+
+
+def cmd_status(_args):
+    state = status()
+    if state["built"]:
+        built = f"built for Hyprland {state['version'] or 'this version'}"
+    elif not state["supported"]:
+        built = "this Hyprland version isn't supported by this Title Bars release yet"
+    else:
+        built = "not built (run `titlebars build`)"
+    say(f"hyprbars:  {built}")
+    say(f"loaded:    {'yes' if state['loaded'] else 'no'}")
+    say(f"hooked up: {'yes' if state['hooked'] else 'no'}")
+
+
+def cmd_load(_args):
+    """Everything the panel needs, as one line of JSON."""
+    defaults, schema = load_spec()
+    try:
+        user, problem = read_settings(defaults, schema), ""
+    except Refused as error:
+        user, problem = {}, str(error)
+    say(json.dumps({
+        "defaults": defaults,
+        "schema": schema,
+        "user": user,
+        "problem": problem,
+        "palette": theme_palette(),
+        "status": status(),
+        "eyedropper": os.access(HYPRPICKER, os.X_OK),
+    }, separators=(",", ":"), ensure_ascii=False))
+
+
+def cmd_offer_setup(_args):
+    """Prints "yes" the first time the plugin runs without being set up.
+
+    The plugin's service uses this to open the panel once after install, so
+    setup is one click in the panel rather than steps in a terminal.
+    """
+    state = status()
+    if state["built"] and state["hooked"]:
+        say("no")
+        return
+    sdir = open_dir((".local", "state", "titlebars"), create=True)
+    try:
+        try:
+            os.stat("setup-offered", dir_fd=sdir, follow_symlinks=False)
+            say("no")
+            return
+        except FileNotFoundError:
+            pass
+        write_file(sdir, "setup-offered", b"")
+        say("yes")
+    finally:
+        os.close(sdir)
+
+
+def cmd_hypr(_args):
+    """What hypr/titlebars.lua needs, read safely on Hyprland's behalf.
+
+    Hyprland runs this while evaluating its config, so it must never talk to
+    Hyprland (no hyprctl) and falls back to the defaults on any problem.
+    """
+    defaults, schema = load_spec()
+    problems, rejected = [], []
+    try:
+        changes = read_settings(defaults, schema, rejected)
+    except Refused as error:
+        changes = {}
+        problems.append(str(error) + ", using the defaults")
+    if rejected:
+        problems.append("ignored invalid " + ", ".join(rejected))
+    try:
+        _, features = build_state()
+    except Refused:
+        features = ""
+    say(json.dumps({
+        "defaults": defaults,
+        "settings": merged(defaults, changes),
+        "palette": theme_palette(),
+        "gear": "opposite" in features.split(),
+        "problems": problems,
+    }, separators=(",", ":"), ensure_ascii=False))
+
+
+# Build ------------------------------------------------------------------------------------------------
+
+VENDORED = ("third_party", "hyprbars")
+SOURCES = ("main.cpp", "barDeco.cpp", "BarPassElement.cpp")
+HEADERS = ("barDeco.hpp", "BarPassElement.hpp", "globals.hpp")
+PKG_DEPS = ("pixman-1", "libdrm", "hyprland", "libinput", "libudev", "wayland-server", "xkbcommon")
+
+
+def supported_version(commit):
+    return read_plugin_json("hypr/pins.json").get("hyprland", {}).get(commit)
+
+
+def vendored_sources():
+    """The hyprbars files shipped with this plugin, and a digest of them."""
+    files = {}
+    digest = hashlib.sha256()
+    for name in SOURCES + HEADERS:
+        with open(os.path.join(PLUGIN_DIR, *VENDORED, name), "rb") as source:
+            data = source.read(MAX_PLUGIN_FILE + 1)
+        if len(data) > MAX_PLUGIN_FILE:
+            raise Refused(f"{name} is too large")
+        files[name] = data
+        digest.update(name.encode() + b"\0" + data + b"\0")
+    return files, digest.hexdigest()
+
+
+def cmd_build(args):
+    force = args == ["--force"]
+    if args and not force:
+        raise Refused("usage: titlebars build [--force]")
+    for tool in (CXX, PKG_CONFIG):
+        if not os.access(tool, os.X_OK):
+            raise Refused(f"{tool} is needed to build hyprbars (from the base-devel package)")
+
+    commit = hyprland_commit()
+    version = supported_version(commit)
+    if not version:
+        raise Refused(
+            f"this Title Bars release doesn't support Hyprland {commit[:12]} yet. "
+            f"Update the plugin (omarchy plugin update {PLUGIN_ID}); the previous build stays in place."
+        )
+    files, digest = vendored_sources()
+    wanted = [commit, digest]
+    stamp, _ = build_state()
+    if not force and stamp == wanted:
+        say(f"hyprbars is already built for Hyprland {version}")
+        return
+
+    _, cflags = run([PKG_CONFIG, "--cflags", *PKG_DEPS], timeout=30, limit=64 * KiB)
+    flags = shlex.split(cflags)
+    if not all(flag.startswith(("-I", "-D", "-pthread", "-isystem")) for flag in flags):
+        raise Refused("pkg-config returned unexpected compiler flags")
+
+    bdir = open_dir(BUILD_DIR, create=True)
+    work = "build-" + secrets.token_hex(6)
+    try:
+        # Checkouts left by older versions of this plugin.
+        for old in ("hyprland-plugins",):
+            try:
+                if stat.S_ISDIR(os.stat(old, dir_fd=bdir, follow_symlinks=False).st_mode):
+                    shutil.rmtree(old, dir_fd=bdir)
+            except FileNotFoundError:
+                pass
+        os.mkdir(work, 0o700, dir_fd=bdir)
+        wfd = os.open(work, DIR_FLAGS, dir_fd=bdir)
+        try:
+            for name, data in files.items():
+                write_file(wfd, name, data)
+
+            say(f"Building hyprbars for Hyprland {version} (a minute or two)...")
+            # The compiler works inside the private directory through the inherited descriptor.
+            argv = [CXX, "-O2", "-w", "-shared", "-fPIC", "-std=c++2b", "--no-gnu-unique", *flags, *SOURCES, "-o", "hyprbars.so"]
+            code, out = run(argv, timeout=1800, pass_fds=(wfd,), cwd=f"/proc/self/fd/{wfd}", keep_tail=True)
+            if code != 0:
+                raise Refused(f"building hyprbars failed: {out.strip()[-800:]}")
+            built = read_file(wfd, "hyprbars.so", MAX_PLUGIN_SO)
+        finally:
+            os.close(wfd)
+        if not built:
+            raise Refused("the build produced no hyprbars.so")
+
+        # Rename into place, so a running Hyprland keeps its mapped copy intact.
+        write_file(bdir, "hyprbars.so", built, mode=0o644)
+        write_file(bdir, "features", b"opposite\n")
+        write_file(bdir, "built-for-hyprland", (" ".join(wanted) + "\n").encode())
+        say(f"Installed hyprbars for Hyprland {version}")
+    finally:
+        try:
+            shutil.rmtree(work, dir_fd=bdir)
+        except FileNotFoundError:
+            pass
+        os.close(bdir)
+
+
+# Setup and uninstall ------------------------------------------------------------------------------------
+
+STUB = """-- Window title bars from the Title Bars Omarchy plugin (marcho78.titlebars).
 -- Written by `titlebars setup`. Run `titlebars uninstall` to turn them off.
 local plugin = os.getenv("HOME") .. "/.config/omarchy/plugins/marcho78.titlebars"
 local module = plugin .. "/hypr/titlebars.lua"
@@ -246,86 +809,241 @@ if file then
     hl.notification.create({ text = "Title Bars: " .. tostring(problem), duration = 10000, icon = "error" })
   end
 end
-EOF
+"""
 
-  if ! grep -qF "$REQUIRE_LINE" "$HYPR_CONFIG"; then
-    cp "$HYPR_CONFIG" "$HYPR_CONFIG.bak.$(date +%s)"
-    if grep -q '^require("hypr.autostart")' "$HYPR_CONFIG"; then
-      sed -i "/^require(\"hypr.autostart\")/a $REQUIRE_LINE" "$HYPR_CONFIG"
-    else
-      printf '\n%s\n' "$REQUIRE_LINE" >>"$HYPR_CONFIG"
-    fi
-  fi
-
-  mkdir -p "$(dirname "$HOOK")"
-  cat >"$HOOK" <<EOF
-#!/bin/bash
+HOOK = f"""#!/bin/bash
 # Rebuild hyprbars for Title Bars when an update brings a new Hyprland.
-titlebars="\$HOME/.config/omarchy/plugins/$PLUGIN_ID/bin/titlebars"
-[[ -x \$titlebars ]] && exec "\$titlebars" build
-EOF
-  chmod 755 "$HOOK"
+titlebars="$HOME/.config/omarchy/plugins/{PLUGIN_ID}/bin/titlebars"
+[[ -f $titlebars ]] && exec {PYTHON} -I "$titlebars" build
+"""
 
-  add_menu_entry
-  mkdir -p "$(dirname "$CLI_LINK")"
-  ln -sfn "$PLUGIN_DIR/bin/titlebars" "$CLI_LINK"
 
-  if ! omarchy-shell shell listPlugins 2>/dev/null | jq -e --arg id "$PLUGIN_ID" '.[] | select(.id == $id and .enabled)' >/dev/null 2>&1; then
-    omarchy plugin enable "$PLUGIN_ID" >/dev/null 2>&1 || true
-  fi
+def strip_jsonc(text):
+    """How the Omarchy menu reads JSONC: drop comment lines and trailing commas."""
+    text = re.sub(r"^\s*//[^\n]*(\n|$)", "", text, flags=re.M)
+    return re.sub(r",(\s*[}\]])", r"\1", text)
 
-  reload_hyprland
-  echo "Title bars are on. Customize them from Omarchy menu > Style > Title Bars, or run \`titlebars settings\`."
+
+def menu_valid(text):
+    try:
+        return isinstance(json.loads(strip_jsonc(text)), dict)
+    except ValueError:
+        return False
+
+
+def edit_text_file(dfd, name, edit, mode_default=0o644, backup=False):
+    data = read_file(dfd, name, MAX_CONFIG_FILE)
+    old = data.decode("utf-8") if data is not None else None
+    new = edit(old)
+    if new is None or new == old:
+        return False
+    if backup and old is not None:
+        write_file(dfd, f"{name}.bak.{int(time.time())}", data, mode=0o600)
+    mode = mode_default
+    if data is not None:
+        mode = stat.S_IMODE(os.stat(name, dir_fd=dfd, follow_symlinks=False).st_mode) & 0o755
+    write_file(dfd, name, new.encode("utf-8"), mode=mode)
+    return True
+
+
+def add_require(text):
+    if text is None:
+        raise Refused(f"{HOME}/.config/hypr/{HYPR_CONFIG} doesn't exist")
+    lines = text.splitlines(keepends=True)
+    if any(line.strip() == REQUIRE_LINE for line in lines):
+        return None
+    for i, line in enumerate(lines):
+        if line.strip() == 'require("hypr.autostart")':
+            lines.insert(i + 1, REQUIRE_LINE + "\n")
+            return "".join(lines)
+    return text + ("" if text.endswith("\n") else "\n") + "\n" + REQUIRE_LINE + "\n"
+
+
+def remove_require(text):
+    if text is None:
+        return None
+    return "".join(line for line in text.splitlines(keepends=True) if line.strip() != REQUIRE_LINE)
+
+
+def add_menu(text):
+    if text is None:
+        return "{\n" + MENU_ENTRY + "\n}\n"
+    lines = text.splitlines(keepends=True)
+    kept = [line for line in lines if MENU_KEY not in line]
+    for i, line in enumerate(kept):
+        if line.lstrip().startswith("{"):
+            new = "".join(kept[: i + 1] + [MENU_ENTRY + "\n"] + kept[i + 1:])
+            if not menu_valid(new):
+                raise Refused(f"couldn't add Title Bars to {MENU_FILE}; add this line yourself:\n{MENU_ENTRY}")
+            return new
+    raise Refused(f"{MENU_FILE} has no opening brace; add this line yourself:\n{MENU_ENTRY}")
+
+
+def remove_menu(text):
+    if text is None:
+        return None
+    new = "".join(line for line in text.splitlines(keepends=True) if MENU_KEY not in line)
+    return new if menu_valid(new) else None
+
+
+def link_cli():
+    target = os.path.join(PLUGIN_DIR, "bin", "titlebars")
+    dfd = open_dir(BIN_DIR, create=True)
+    try:
+        try:
+            st = os.stat("titlebars", dir_fd=dfd, follow_symlinks=False)
+        except FileNotFoundError:
+            os.symlink(target, "titlebars", dir_fd=dfd)
+            return
+        if stat.S_ISLNK(st.st_mode) and os.readlink("titlebars", dir_fd=dfd) == target:
+            return
+        say(f"Note: {HOME}/.local/bin/titlebars already exists and isn't ours; left it alone.")
+    finally:
+        os.close(dfd)
+
+
+def unlink_cli():
+    target = os.path.join(PLUGIN_DIR, "bin", "titlebars")
+    dfd = open_dir(BIN_DIR)
+    if dfd is None:
+        return
+    try:
+        st = os.stat("titlebars", dir_fd=dfd, follow_symlinks=False)
+        if stat.S_ISLNK(st.st_mode) and os.readlink("titlebars", dir_fd=dfd) == target:
+            os.unlink("titlebars", dir_fd=dfd)
+    except FileNotFoundError:
+        pass
+    finally:
+        os.close(dfd)
+
+
+def enable_plugin():
+    try:
+        _, out = run([OMARCHY_SHELL, "shell", "listPlugins"], timeout=15, limit=1 * MiB)
+        plugins = json.loads(out)
+        if any(p.get("id") == PLUGIN_ID and p.get("enabled") for p in plugins if isinstance(p, dict)):
+            return
+    except (Refused, ValueError):
+        pass
+    try:
+        run([OMARCHY, "plugin", "enable", PLUGIN_ID], timeout=30, limit=64 * KiB)
+    except Refused:
+        say(f"Note: enable the panel with `omarchy plugin enable {PLUGIN_ID}`.")
+
+
+def cmd_setup(_args):
+    cmd_build([])
+
+    hdir = open_dir(HYPR_DIR)
+    if hdir is None:
+        raise Refused(f"{HOME}/.config/hypr doesn't exist")
+    try:
+        write_file(hdir, HYPR_STUB, STUB.encode(), mode=0o644)
+        edit_text_file(hdir, HYPR_CONFIG, add_require, backup=True)
+    finally:
+        os.close(hdir)
+
+    kdir = open_dir(HOOK_DIR, create=True)
+    try:
+        write_file(kdir, HOOK_FILE, HOOK.encode(), mode=0o755)
+    finally:
+        os.close(kdir)
+
+    mdir = open_dir(MENU_DIR, create=True)
+    try:
+        edit_text_file(mdir, MENU_FILE, add_menu)
+    finally:
+        os.close(mdir)
+
+    link_cli()
+    enable_plugin()
+    reload_hyprland()
+    say("Title bars are on. Customize them from Omarchy menu > Style > Title Bars, or run `titlebars settings`.")
+
+
+def cmd_uninstall(args):
+    purge = args == ["--purge"]
+    if args and not purge:
+        raise Refused("usage: titlebars uninstall [--purge]")
+
+    hdir = open_dir(HYPR_DIR)
+    if hdir is not None:
+        try:
+            edit_text_file(hdir, HYPR_CONFIG, remove_require, backup=True)
+            remove_file(hdir, HYPR_STUB)
+        finally:
+            os.close(hdir)
+    kdir = open_dir(HOOK_DIR)
+    if kdir is not None:
+        try:
+            remove_file(kdir, HOOK_FILE)
+        finally:
+            os.close(kdir)
+    mdir = open_dir(MENU_DIR)
+    if mdir is not None:
+        try:
+            edit_text_file(mdir, MENU_FILE, remove_menu)
+        finally:
+            os.close(mdir)
+    unlink_cli()
+
+    if purge:
+        write_settings({})
+        bdir = open_dir(BUILD_DIR[:-1])
+        if bdir is not None:
+            try:
+                if stat.S_ISDIR(os.stat(BUILD_DIR[-1], dir_fd=bdir, follow_symlinks=False).st_mode):
+                    shutil.rmtree(BUILD_DIR[-1], dir_fd=bdir)
+            except FileNotFoundError:
+                pass
+            finally:
+                os.close(bdir)
+
+    reload_hyprland()
+    say("Title bars are off. Hyprland unloads hyprbars at the next login.")
+
+
+COMMANDS = {
+    "settings": cmd_settings,
+    "open": cmd_settings,
+    "get": cmd_get,
+    "set": cmd_set,
+    "reset": cmd_reset,
+    "status": cmd_status,
+    "setup": cmd_setup,
+    "build": cmd_build,
+    "uninstall": cmd_uninstall,
+    "load": cmd_load,
+    "save": cmd_save,
+    "hypr": cmd_hypr,
+    "offer-setup": cmd_offer_setup,
 }
 
-cmd_uninstall() {
-  if [[ -f $HYPR_CONFIG ]] && grep -qF "$REQUIRE_LINE" "$HYPR_CONFIG"; then
-    cp "$HYPR_CONFIG" "$HYPR_CONFIG.bak.$(date +%s)"
-    sed -i "\#^$REQUIRE_LINE\$#d" "$HYPR_CONFIG"
-  fi
-  rm -f "$HYPR_STUB" "$HOOK"
-  [[ -L $CLI_LINK ]] && rm -f "$CLI_LINK"
-  if [[ -f $MENU ]] && grep -q '"style.titlebars"' "$MENU"; then
-    sed -i '/"style.titlebars"/d' "$MENU"
-  fi
-  if [[ ${1:-} == "--purge" ]]; then
-    rm -rf "$SETTINGS" "$BUILD_DIR"
-  fi
 
-  reload_hyprland
-  echo "Title bars are off. Hyprland unloads hyprbars on the next login."
-}
+def main(argv):
+    os.umask(0o077)
+    if len(argv) < 2 or argv[1] in ("-h", "--help", "help"):
+        say(__doc__.split("\n\nThe panel")[0])
+        return 0 if len(argv) >= 2 else 1
+    command = COMMANDS.get(argv[1])
+    if command is None:
+        sys.stderr.write(f"titlebars: unknown command '{argv[1]}' (see `titlebars --help`)\n")
+        return 2
+    try:
+        command(argv[2:])
+    except Refused as error:
+        sys.stderr.write(f"titlebars: {error}\n")
+        return 1
+    except OSError as error:
+        sys.stderr.write(f"titlebars: {error.strerror or error}\n")
+        return 1
+    return 0
 
-cmd_status() {
-  local hyprland_commit built="not built" loaded="no" hooked="no"
-  hyprland_commit=$(sed -n 's/^#define GIT_COMMIT_HASH *"\([0-9a-f]*\)".*/\1/p' "$HYPRLAND_VERSION_H" 2>/dev/null || true)
-  if [[ -f $BUILD_PLUGIN ]]; then
-    built="built for another Hyprland (run \`titlebars build\`)"
-    [[ $(cat "$BUILD_STAMP" 2>/dev/null) == "$hyprland_commit" ]] && built="built for Hyprland $(pkg-config --modversion hyprland)"
-  fi
-  hyprctl plugin list 2>/dev/null | grep -q '^Plugin hyprbars' && loaded="yes"
-  grep -qF "$REQUIRE_LINE" "$HYPR_CONFIG" 2>/dev/null && [[ -f $HYPR_STUB ]] && hooked="yes"
 
-  echo "hyprbars:  $built"
-  echo "loaded:    $loaded"
-  echo "hooked up: $hooked"
-  echo "settings:  $([[ -s $SETTINGS ]] && echo "$SETTINGS" || echo "defaults")"
-}
-
-command="${1:-}"
-shift || true
-case $command in
-settings | open) cmd_settings "$@" ;;
-set) cmd_set "$@" ;;
-get) cmd_get "$@" ;;
-reset) cmd_reset ;;
-status) cmd_status ;;
-setup) cmd_setup ;;
-build) cmd_build "$@" ;;
-uninstall) cmd_uninstall "$@" ;;
-"" | -h | --help | help) usage ;;
-*)
-  usage >&2
-  exit 1
-  ;;
-esac
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        sys.exit(0)
