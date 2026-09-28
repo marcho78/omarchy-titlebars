@@ -191,11 +191,16 @@ class Setup(Base):
             cli.remove_owned(kdir, cli.HOOK_FILE, "hook")
             self.assertEqual(self.read(".config/hypr/titlebars.lua"), "-- my own file\n")
             self.assertEqual(self.read(hook_rel), "#!/bin/bash\necho mine\n")
-            # Ours (current or first-release header) is replaced and removed.
-            for name, text, legacy in ((cli.HYPR_STUB, cli.STUB, "-- Window title bars from the Title Bars Omarchy plugin (marcho78.titlebars).\n"),
-                                       (cli.HOOK_FILE, cli.HOOK, "#!/bin/bash\n# Rebuild hyprbars for Title Bars when an update brings a new Hyprland.\n")):
-                dfd = hdir if name == cli.HYPR_STUB else kdir
-                cli.write_file(dfd, name, legacy.encode())
+            # A foreign file that merely mentions our mark is still foreign.
+            cli.write_file(hdir, cli.HYPR_STUB, ("-- " + cli.OWNER_MARK + "\n-- but mine\n").encode())
+            with self.assertRaises(cli.Refused):
+                cli.write_owned(hdir, cli.HYPR_STUB, cli.STUB, 0o644, "stub")
+            # Our file, even one byte changed, is foreign.
+            cli.write_file(kdir, cli.HOOK_FILE, (cli.HOOK + "\n").encode())
+            self.assertEqual(cli.file_state(kdir, cli.HOOK_FILE), "foreign")
+            # Exactly what we wrote is replaced and removed.
+            for dfd, name, text in ((hdir, cli.HYPR_STUB, cli.STUB), (kdir, cli.HOOK_FILE, cli.HOOK)):
+                cli.write_file(dfd, name, text.encode())
                 cli.write_owned(dfd, name, text, 0o644, name)
                 self.assertEqual(cli.file_state(dfd, name), "ours")
                 cli.remove_owned(dfd, name, name)
@@ -224,17 +229,6 @@ class Setup(Base):
         cli.remove_known_files(cli.BUILD_DIR, cli.BUILD_FILES)
         self.assertEqual(os.listdir(self.path(build)), ["notes.txt"])
 
-    def test_legacy_settings_move_only_when_they_are_ours(self):
-        cli = self.cli
-        self.write(".config/omarchy/titlebars.json", '{"buttons": "left"}')
-        cli.migrate_settings()
-        self.assertFalse(os.path.exists(self.path(".config/omarchy/titlebars.json")))
-        self.assertEqual(json.loads(self.read(".config/omarchy/marcho78.titlebars.json")), {"buttons": "left"})
-        os.unlink(self.path(".config/omarchy/marcho78.titlebars.json"))
-        self.write(".config/omarchy/titlebars.json", '{"someone": "else"}')
-        cli.migrate_settings()
-        self.assertEqual(self.read(".config/omarchy/titlebars.json"), '{"someone": "else"}')
-        self.assertFalse(os.path.exists(self.path(".config/omarchy/marcho78.titlebars.json")))
 
     def test_menu_entry_keeps_the_file_valid(self):
         cli = self.cli

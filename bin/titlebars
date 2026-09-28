@@ -64,7 +64,6 @@ VERSION_H = "/usr/include/hyprland/src/version.h"
 
 SETTINGS_DIR = (".config", "omarchy")
 SETTINGS_FILE = PLUGIN_ID + ".json"
-LEGACY_SETTINGS_FILE = "titlebars.json"
 THEME_DIR = (".local", "state", "omarchy", "current", "theme")
 BUILD_DIR = (".local", "share", PLUGIN_ID)
 STATE_DIR = (".local", "state", PLUGIN_ID)
@@ -76,15 +75,14 @@ BIN_DIR = (".local", "bin")
 
 HYPR_CONFIG = "hyprland.lua"
 HYPR_STUB = "titlebars.lua"
-# Everything setup writes carries this mark; nothing without it is replaced or removed.
+# Marks the require line setup adds, and heads the files it writes.
 OWNER_MARK = "Managed by marcho78.titlebars"
 REQUIRE_LINE = 'require("hypr.titlebars") -- ' + OWNER_MARK
 # Written by the first release (a48d33e), before the mark existed.
 LEGACY_REQUIRE_LINE = 'require("hypr.titlebars")'
-LEGACY_MARKS = (
-    "Window title bars from the Title Bars Omarchy plugin (marcho78.titlebars).",
-    "# Rebuild hyprbars for Title Bars when an update brings a new Hyprland.",
-)
+# SHA-256 of the loader and hook exactly as the previous release (2c3eb50) wrote them.
+LEGACY_STUB_SHA256 = "840961ef00ba19147664b684cb7ba4cc60c7777731744891a84bb978bf25eaa0"
+LEGACY_HOOK_SHA256 = "aa027a6055ab3702a3239532b6d1eb981e9c83281b031214ae4adb240376e015"
 HOOK_FILE = "titlebars.hook"
 MENU_FILE = "omarchy-menu.jsonc"
 MENU_KEY = '"style.titlebars"'
@@ -437,32 +435,6 @@ def write_settings(changes):
             write_file(dfd, SETTINGS_FILE, (json.dumps(changes, indent=2) + "\n").encode())
         else:
             remove_file(dfd, SETTINGS_FILE)
-    finally:
-        os.close(dfd)
-
-
-def migrate_settings():
-    """Move settings from the first release's unnamespaced file, but only a file
-    that is plainly ours: a JSON object holding nothing but Title Bars settings."""
-    defaults, _schema = load_spec()
-    dfd = open_dir(SETTINGS_DIR)
-    if dfd is None:
-        return
-    try:
-        if read_file(dfd, SETTINGS_FILE, MAX_SETTINGS) is not None:
-            return
-        data = read_file(dfd, LEGACY_SETTINGS_FILE, MAX_SETTINGS)
-        if data is None:
-            return
-        try:
-            raw = json.loads(data)
-        except (ValueError, UnicodeDecodeError):
-            raw = None
-        if not isinstance(raw, dict) or not set(raw) <= set(defaults):
-            say(f"Note: left {HOME}/.config/omarchy/{LEGACY_SETTINGS_FILE} alone; it doesn't look like Title Bars settings.")
-            return
-        write_file(dfd, SETTINGS_FILE, data)
-        os.unlink(LEGACY_SETTINGS_FILE, dir_fd=dfd)
     finally:
         os.close(dfd)
 
@@ -873,17 +845,22 @@ def menu_valid(text):
         return False
 
 
-def owned_text(data):
-    head = data[:1024].decode("utf-8", "replace")
-    return OWNER_MARK in head or any(mark in head for mark in LEGACY_MARKS)
+def known_contents(name):
+    """SHA-256 of every exact content Title Bars has written to this file name."""
+    if name == HYPR_STUB:
+        return {hashlib.sha256(STUB.encode()).hexdigest(), LEGACY_STUB_SHA256}
+    if name == HOOK_FILE:
+        return {hashlib.sha256(HOOK.encode()).hexdigest(), LEGACY_HOOK_SHA256}
+    return set()
 
 
 def file_state(dfd, name):
-    """"missing", "ours" (carries our mark), or "foreign"."""
+    """"missing", "ours" (byte for byte what Title Bars wrote), or "foreign".
+    A file anyone changed, even by a byte, is foreign and left alone."""
     data = read_file(dfd, name, 256 * KiB)
     if data is None:
         return "missing"
-    return "ours" if owned_text(data) else "foreign"
+    return "ours" if hashlib.sha256(data).hexdigest() in known_contents(name) else "foreign"
 
 
 def write_owned(dfd, name, text, mode, where):
@@ -1028,7 +1005,6 @@ def enable_plugin():
 
 def cmd_setup(_args):
     cmd_build([])
-    migrate_settings()
 
     hdir = open_dir(HYPR_DIR)
     if hdir is None:

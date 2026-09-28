@@ -176,16 +176,17 @@ a byte cap, so no file can stall the compositor. Title Bars writes only:
 | `~/.local/bin/titlebars` | a link to `bin/titlebars` |
 
 **Ownership.** Title Bars only replaces or removes what it wrote. The loader
-and the hook start with a `Managed by marcho78.titlebars` line; if a file at
-either path lacks it, setup stops and uninstall leaves it in place. In
-`hyprland.lua` and the menu file only the exact lines Title Bars adds are
-touched, so your own `require("hypr.titlebars")` or `style.titlebars` entry
-is left alone. The link in `~/.local/bin` is replaced or removed only while it
-points at this plugin. `uninstall --purge` deletes the settings file and the
-named files in the two `marcho78.titlebars` directories above, then removes
-those directories only if they are empty; nothing is deleted recursively. The
-temporary build directory is removed only if it is still the one the build
-created.
+and the hook count as its own only when their content is byte for byte what
+Title Bars writes (or wrote in the previous release, by SHA-256); any other
+file at either path, including one you edited, stops setup and is left in
+place by uninstall. In `hyprland.lua` and the menu file only the exact lines
+Title Bars adds are touched, so your own `require("hypr.titlebars")` or
+`style.titlebars` entry is left alone. The link in `~/.local/bin` is replaced
+or removed only while it points at this plugin. `uninstall --purge` deletes
+the settings file and the named files in the two `marcho78.titlebars`
+directories above, then removes those directories only if they are empty;
+nothing is deleted recursively. The temporary build directory is removed only
+if it is still the one the build created.
 
 **Input and text.** Settings are validated against `schema.json` (types,
 choices, ranges, string lengths and characters) by `bin/titlebars` before they
